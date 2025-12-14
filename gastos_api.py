@@ -80,16 +80,16 @@ def main():
 
         # LOGIN
         page.goto(LOGIN_URL)
-page.goto("https://app.agendapro.com/sign_in", wait_until="networkidle")
+        page.goto("https://app.agendapro.com/sign_in", wait_until="networkidle")
 
-page.wait_for_selector("input[type='email']", timeout=15000)
-page.fill("input[type='email']", USUARIO)
+        page.wait_for_selector("input[type='email']", timeout=15000)
+        page.fill("input[type='email']", USUARIO)
 
-page.wait_for_selector("input[type='password']", timeout=15000)
-page.fill("input[type='password']", PASSWORD)
+        page.wait_for_selector("input[type='password']", timeout=15000)
+        page.fill("input[type='password']", PASSWORD)
 
-page.click("button[type='submit']")
-page.wait_for_timeout(3000)
+        page.click("button[type='submit']")
+        page.wait_for_timeout(3000)
 
         page.wait_for_timeout(2000)
 

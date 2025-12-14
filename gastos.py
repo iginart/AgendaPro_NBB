@@ -35,8 +35,10 @@ session.headers.update({
     "Content-Type": "application/json",
     "Origin": "https://app.agendapro.com",
     "Referer": "https://app.agendapro.com/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+    "X-Requested-With": "XMLHttpRequest"
 })
+
 
 
 # =========================
@@ -62,6 +64,12 @@ resp = session.get(API_URL, params=params)
 
 if resp.status_code != 200:
     raise Exception("Error al consultar API")
+
+if "application/json" not in resp.headers.get("Content-Type", ""):
+    print("Respuesta NO JSON:")
+    print(resp.status_code)
+    print(resp.text[:500])
+    raise Exception("La API no devolvió JSON")
 
 data = resp.json()
 max_pages = data.get("page_number", 1)

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # =========================
 BASE_URL = "https://agendapro.com"
 LOGIN_URL = f"{BASE_URL}/authentication/sign_in"
-API_URL = f"{BASE_URL}/api/views/admin/v1/payments/sales_cash_content_expenses"
+API_URL = "https://app.agendapro.com/api/views/admin/v1/payments/sales_cash_content_expenses"
 
 USERNAME = os.environ.get("AGENDAPRO_USER")
 PASSWORD = os.environ.get("AGENDAPRO_PASS")

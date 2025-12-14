@@ -9,8 +9,12 @@ import time
 LOGIN_URL = "https://app.agendapro.com/sign_in"
 REPORT_URL = "https://app.agendapro.com/sales_cash"
 
-USUARIO = "nachoginart@gmail.com"
-PASSWORD = "Inicio01$"
+USUARIO = os.environ.get("AGENDAPRO_USER")
+PASSWORD = os.environ.get("AGENDAPRO_PASS")
+
+if not USUARIO or not PASSWORD:
+    raise Exception("Faltan variables de entorno AGENDAPRO_USER / AGENDAPRO_PASS")
+
 
 FECHA_INICIO = "01-11-2025"
 FECHA_FIN = "30-11-2025"

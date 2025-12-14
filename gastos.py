@@ -31,9 +31,13 @@ PARAMS_BASE = {
 # =========================
 session = requests.Session()
 session.headers.update({
-    "Accept": "application/json",
-    "Content-Type": "application/json"
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://app.agendapro.com",
+    "Referer": "https://app.agendapro.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
 })
+
 
 # =========================
 # LOGIN

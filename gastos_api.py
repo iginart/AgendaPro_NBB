@@ -80,9 +80,17 @@ def main():
 
         # LOGIN
         page.goto(LOGIN_URL)
-        page.get_by_role("textbox", name="usuario@correo.com").fill(USUARIO)
-        page.get_by_role("textbox", name="Ingresa tu contraseña").fill(PASSWORD)
-        page.get_by_role("button", name="Ingresar").click()
+page.goto("https://app.agendapro.com/sign_in", wait_until="networkidle")
+
+page.wait_for_selector("input[type='email']", timeout=15000)
+page.fill("input[type='email']", USUARIO)
+
+page.wait_for_selector("input[type='password']", timeout=15000)
+page.fill("input[type='password']", PASSWORD)
+
+page.click("button[type='submit']")
+page.wait_for_timeout(3000)
+
         page.wait_for_timeout(2000)
 
         # REPORTE

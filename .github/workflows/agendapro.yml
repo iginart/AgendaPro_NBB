@@ -1,0 +1,40 @@
+name: Descargar gastos AgendaPro
+
+on:
+  schedule:
+    # Corre todos los días a las 06:00 UTC (~03:00 Argentina)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Ejecutar script AgendaPro
+        env:
+          AGENDAPRO_USER: ${{ secrets.AGENDAPRO_USER }}
+          AGENDAPRO_PASS: ${{ secrets.AGENDAPRO_PASS }}
+        run: |
+          python gastos.py
+
+      - name: Commit resultados
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add gastos.json
+          git commit -m "Actualización automática de gastos" || echo "Sin cambios"
+          git push

@@ -40,12 +40,25 @@ wait = WebDriverWait(driver, 20)
 # =========================
 driver.get(LOGIN_URL)
 
-email_input = wait.until(EC.presence_of_element_located((By.NAME, "username")))
-password_input = driver.find_element(By.NAME, "password")
+# =========================
+# LOGIN (React)
+# =========================
+driver.get(LOGIN_URL)
+
+email_input = wait.until(
+    EC.presence_of_element_located((By.XPATH, "//input[@type='email']"))
+)
+
+password_input = wait.until(
+    EC.presence_of_element_located((By.XPATH, "//input[@type='password']"))
+)
 
 email_input.send_keys(USERNAME)
 password_input.send_keys(PASSWORD)
 password_input.send_keys(Keys.ENTER)
+
+# Esperar navegación post-login
+time.sleep(8)
 
 # Esperar que la app cargue
 wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))

@@ -1,14 +1,14 @@
-name: Ejecutar gastos AgendaPro API
+name: Ejecutar AgendaPro Gastos API
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-script:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -21,8 +21,8 @@ jobs:
           pip install playwright
           playwright install chromium
 
-- name: Run python gastos_api.py
-  run: python gastos_api.py
-  env:
-    AGENDAPRO_USER: ${{ secrets.AGENDAPRO_USER }}
-    AGENDAPRO_PASS: ${{ secrets.AGENDAPRO_PASS }}
+      - name: Run gastos_api.py
+        run: python gastos_api.py
+        env:
+          AGENDAPRO_USER: ${{ secrets.AGENDAPRO_USER }}
+          AGENDAPRO_PASS: ${{ secrets.AGENDAPRO_PASS }}

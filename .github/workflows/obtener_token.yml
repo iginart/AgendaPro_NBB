@@ -1,0 +1,39 @@
+name: Obtener cookie AgendaPro
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # cada 6 horas
+  workflow_dispatch:       # permite correrlo a mano
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Ejecutar script de login
+        env:
+          AGENDAPRO_USER: ${{ secrets.AGENDAPRO_USER }}
+          AGENDAPRO_PASS: ${{ secrets.AGENDAPRO_PASS }}
+        run: |
+          python obtener_token.py
+
+      - name: Commit token.json
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add token.json
+          git commit -m "Actualizar token AgendaPro" || echo "Sin cambios"
+          git push

@@ -17,12 +17,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright
+          pip install playwright requests
           python -m playwright install --with-deps chromium
-
+          
       - name: Test AgendaPro login
         env:
           AGENDAPRO_USER: ${{ secrets.AGENDAPRO_USER }}

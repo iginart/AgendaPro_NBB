@@ -1,0 +1,41 @@
+name: Test AgendaPro Login
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Test AgendaPro login
+        env:
+          AGENDAPRO_USER: ${{ secrets.AGENDAPRO_USER }}
+          AGENDAPRO_PASSWORD: ${{ secrets.AGENDAPRO_PASS }}
+        run: |
+          python test_agendapro_login.py
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agendapro-login-diagnostics
+          path: |
+            agendapro-login-error.png
+            agendapro-login-error.html
+          if-no-files-found: ignore

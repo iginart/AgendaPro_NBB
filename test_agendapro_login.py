@@ -39,8 +39,8 @@ def main():
 
             print("Pagina de login cargada")
 
-            page.get_by_label("Email").fill(USUARIO)
-            page.get_by_label("Password").fill(PASSWORD)
+            page.get_by_placeholder("user@example.com").fill(USUARIO)
+            page.get_by_placeholder("Enter your password").fill(PASSWORD)
             page.get_by_role("button", name="Log in").click()
 
             print("Login enviado. Esperando autenticacion...")

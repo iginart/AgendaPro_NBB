@@ -231,6 +231,93 @@ def fetch_v2_transactions(cookie_header, location_id, day):
     return all_rows
 
 
+def fetch_v2_sale_detail(cookie_header, sale_id):
+    url = f"https://agendapro.com/api/views/admin/v2/sales/sale/{sale_id}"
+    r = requests.get(
+        url,
+        headers={
+            "Cookie": cookie_header,
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+        timeout=120,
+    )
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"AgendaPro detalle sale {sale_id}: HTTP {r.status_code}: {r.text[:2000]}"
+        )
+    return r.json()
+
+
+def build_special_sale(detail):
+    return {
+        "sale_id": int(detail["id"]),
+        "internal_id": detail.get("internal_id"),
+        "payment_id": None,
+        "cart_id": detail.get("cart_id"),
+        "status": detail.get("status"),
+        "paid_at_source": detail.get("paid_at"),
+        "business_date": business_date_from_utc(detail.get("paid_at")),
+        "total_amount": num(detail.get("total_amount")),
+        "paid_amount": num(detail.get("paid_amount")),
+        "pending_amount": num(detail.get("pending_amount")),
+        "giftcard_amount": num(detail.get("giftcard_amount")) or 0,
+        "sale_type": "giftcard_sale" if any(
+            (i.get("item_type") or "").lower() == "giftcard"
+            for i in (detail.get("items") or [])
+        ) else "special_sale",
+        "client_id": detail.get("client_id"),
+        "client_first_name": detail.get("client_first_name"),
+        "client_last_name": detail.get("client_last_name"),
+        "client_email": detail.get("client_email"),
+        "client_identification_number": None,
+        "location_id": detail.get("location_id"),
+        "location_name": detail.get("location_name"),
+        "document_status": None,
+        "document_url": None,
+        "note": detail.get("note"),
+        "synced_at": now_utc_iso(),
+    }
+
+
+def build_special_items(detail):
+    rows = []
+    sale_id = int(detail["id"])
+    for idx, item in enumerate(detail.get("items") or []):
+        item_type = (item.get("item_type") or "special").lower()
+        # AgendaPro no entrega ID del item en este endpoint.
+        # Generamos un ID tecnico deterministico negativo, estable por venta y posicion.
+        source_item_id = -(sale_id * 100 + idx + 1)
+        rows.append({
+            "booking_id": None,
+            "source_item_id": source_item_id,
+            "sale_id": sale_id,
+            "payment_id": None,
+            "receipt_id": None,
+            "client_id": detail.get("client_id"),
+            "service_id": None,
+            "service_name": None,
+            "service_provider_id": None,
+            "service_provider_name": None,
+            "session_number": None,
+            "price": num(item.get("total")),
+            "list_price": num(item.get("subtotal")),
+            "discount": None,
+            "item_type": item_type,
+            "product_name": None,
+            "quantity": num(item.get("quantity")) or 1,
+            "seller_id": None,
+            "seller_type": None,
+            "item_name": item.get("name"),
+            "subtotal": num(item.get("subtotal")),
+            "total": num(item.get("total")),
+            "synced_at": now_utc_iso(),
+        })
+    return rows
+
+
 def build_sales(sales, payments):
     payment_by_id = {
         int(p["id"]): p
@@ -256,10 +343,12 @@ def build_sales(sales, payments):
             "total_amount": num(sale.get("total_amount")),
             "paid_amount": num(sale.get("paid_amount")),
             "pending_amount": num(sale.get("pending_amount")),
+            "giftcard_amount": num(sale.get("giftcard_amount")) or 0,
+            "sale_type": "regular_sale",
             "client_id": client.get("id"),
             "client_first_name": client.get("first_name") or sale.get("client_first_name"),
             "client_last_name": client.get("last_name") or sale.get("client_last_name"),
-            "client_email": client.get("email"),
+            "client_email": client.get("email") or sale.get("client_email"),
             "client_identification_number": client.get("identification_number"),
             "location_id": sale.get("location_id"),
             "location_name": sale.get("location_name"),
@@ -470,9 +559,45 @@ def run_one_day(cookie_header, location_id, day):
     sale_ids = {r["sale_id"] for r in sale_rows}
     orphan_transactions = sorted({r["sale_id"] for r in transaction_rows} - sale_ids)
 
-    if orphan_transactions:
+    resolved_special_sales = []
+    unresolved_transactions = []
+    special_item_rows = []
+
+    for orphan_sale_id in orphan_transactions:
+        detail = fetch_v2_sale_detail(cookie_header, orphan_sale_id)
+        if not detail:
+            unresolved_transactions.append(orphan_sale_id)
+            continue
+
+        detail_location = detail.get("location_id")
+        if detail_location is not None and int(detail_location) != int(location_id):
+            unresolved_transactions.append(orphan_sale_id)
+            log(
+                f"WARNING sale especial {orphan_sale_id}: local detalle={detail_location}, "
+                f"local esperado={location_id}"
+            )
+            continue
+
+        special_sale = build_special_sale(detail)
+        sale_rows.append(special_sale)
+        special_items = build_special_items(detail)
+        item_rows.extend(special_items)
+        special_item_rows.extend(special_items)
+        resolved_special_sales.append({
+            "sale_id": orphan_sale_id,
+            "sale_type": special_sale["sale_type"],
+            "items": len(special_items),
+        })
+
+        log(
+            f"Venta especial resuelta: sale_id={orphan_sale_id} "
+            f"tipo={special_sale['sale_type']} items={len(special_items)}"
+        )
+
+    if unresolved_transactions:
         raise RuntimeError(
-            f"Local {location_id} {day.isoformat()}: transacciones huerfanas {orphan_transactions[:20]}"
+            f"Local {location_id} {day.isoformat()}: transacciones no resueltas "
+            f"{unresolved_transactions[:20]}"
         )
 
     # Primero padres, luego hijos.
@@ -482,14 +607,19 @@ def run_one_day(cookie_header, location_id, day):
 
     return {
         "payments": len(payments),
-        "sales": len(sales),
+        "sales": len(sales) + len(resolved_special_sales),
+        "regular_sales": len(sales),
+        "special_sales": len(resolved_special_sales),
         "transactions": len(transactions),
         "items": len(item_rows),
         "missing_payments": len(missing_payments),
         "payments_without_sale": len(payments_without_sale),
         "orphan_transactions": len(orphan_transactions),
+        "resolved_special_sales": len(resolved_special_sales),
         "memberships": memberships,
-        "giftcards": giftcards,
+        "giftcards": giftcards + sum(
+            1 for r in special_item_rows if r["item_type"] == "giftcard"
+        ),
         "mock_bookings": sum(1 for r in item_rows if r["item_type"] == "mock_booking"),
         "products": sum(1 for r in item_rows if r["item_type"] == "product"),
     }
@@ -524,6 +654,7 @@ def main():
         "products": 0,
         "memberships": 0,
         "giftcards": 0,
+        "special_sales": 0,
         "days_processed": 0,
         "warnings": [],
     }
@@ -549,6 +680,7 @@ def main():
                 totals["products"] += summary["products"]
                 totals["memberships"] += summary["memberships"]
                 totals["giftcards"] += summary["giftcards"]
+                totals["special_sales"] += summary["special_sales"]
                 totals["days_processed"] += 1
 
                 warn_parts = []
@@ -560,6 +692,8 @@ def main():
                     warn_parts.append(f"memberships={summary['memberships']}")
                 if summary["giftcards"]:
                     warn_parts.append(f"giftcards={summary['giftcards']}")
+                if summary["special_sales"]:
+                    warn_parts.append(f"ventas_especiales={summary['special_sales']}")
                 if warn_parts:
                     totals["warnings"].append(
                         f"{location_id} {day.isoformat()}: " + ", ".join(warn_parts)
@@ -568,7 +702,7 @@ def main():
                 log(
                     f"{day.isoformat()} | sales={summary['sales']} | items={summary['items']} "
                     f"| trans={summary['transactions']} | mock={summary['mock_bookings']} "
-                    f"| products={summary['products']}"
+                    f"| products={summary['products']} | special={summary['special_sales']}"
                 )
                 day += timedelta(days=1)
 
@@ -580,7 +714,8 @@ def main():
             "mock_bookings": totals["mock_bookings"],
             "products": totals["products"],
             "memberships_detected_not_loaded": totals["memberships"],
-            "giftcards_detected_not_loaded": totals["giftcards"],
+            "giftcards_loaded_or_detected": totals["giftcards"],
+            "special_sales_resolved": totals["special_sales"],
             "warnings": totals["warnings"][:100],
         }
 
@@ -608,7 +743,8 @@ def main():
         log(f"Mock bookings: {totals['mock_bookings']}")
         log(f"Productos:     {totals['products']}")
         log(f"Memberships detectados: {totals['memberships']}")
-        log(f"Giftcards detectadas:    {totals['giftcards']}")
+        log(f"Giftcards cargadas/detectadas: {totals['giftcards']}")
+        log(f"Ventas especiales resueltas:  {totals['special_sales']}")
         log(f"Warnings:      {len(totals['warnings'])}")
         log("========================================")
 

@@ -602,7 +602,8 @@ def run_one_day(cookie_header, location_id, day):
 
     # Primero padres, luego hijos.
     supabase_upsert("agenda_sales", sale_rows, "sale_id")
-        item_keys = [
+
+    item_keys = [
         "booking_id",
         "source_item_id",
         "sale_id",
@@ -632,9 +633,18 @@ def run_one_day(cookie_header, location_id, day):
         {key: row.get(key) for key in item_keys}
         for row in item_rows
     ]
-    supabase_upsert("agenda_sale_items", item_rows, "item_type,source_item_id")
-    supabase_upsert("agenda_payment_transactions", transaction_rows, "transaction_id")
 
+    supabase_upsert(
+        "agenda_sale_items",
+        item_rows,
+        "item_type,source_item_id"
+    )
+
+    supabase_upsert(
+        "agenda_payment_transactions",
+        transaction_rows,
+        "transaction_id"
+    )
     return {
         "payments": len(payments),
         "sales": len(sales) + len(resolved_special_sales),

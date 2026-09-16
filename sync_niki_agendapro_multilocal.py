@@ -1,5 +1,7 @@
 import os
 import time
+import json
+from decimal import Decimal, InvalidOperation
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -13,7 +15,7 @@ SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 
 ARG_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 UTC = timezone.utc
-DAYS_BACK = 7
+ROLLING_DAYS = 14
 PER_PAGE = 100
 
 LOCATIONS = [
@@ -33,6 +35,34 @@ LOCATIONS = [
     106380,
     297090,
 ]
+
+
+
+SALE_COMPARE_FIELDS = [
+    "internal_id", "payment_id", "cart_id", "status", "paid_at_source",
+    "business_date", "total_amount", "paid_amount", "pending_amount",
+    "giftcard_amount", "sale_type", "client_id", "client_first_name",
+    "client_last_name", "client_email", "client_identification_number",
+    "location_id", "location_name", "document_status", "document_url", "note",
+]
+
+ITEM_COMPARE_FIELDS = [
+    "booking_id", "source_item_id", "sale_id", "payment_id", "receipt_id",
+    "client_id", "service_id", "service_name", "service_provider_id",
+    "service_provider_name", "session_number", "price", "list_price",
+    "discount", "item_type", "product_name", "quantity", "seller_id",
+    "seller_type", "item_name", "subtotal", "total",
+]
+
+TRANSACTION_COMPARE_FIELDS = [
+    "transaction_id", "sale_id", "sale_internal_id", "paid_at_source",
+    "business_date", "amount", "tip", "external_reference",
+    "payment_method_name", "payment_method_key", "payment_method_type",
+    "transaction_type", "installments", "settled_status",
+]
+
+ITEM_KEYS = ITEM_COMPARE_FIELDS + ["synced_at"]
+CANCELLED_STATUSES = {"cancelled", "canceled", "void", "voided", "refunded"}
 
 COOKIES_CLAVE = {
     "ap_cognito_authorization",
@@ -112,6 +142,108 @@ def supabase_update(table, filters, values):
     )
     if r.status_code not in (200, 204):
         raise RuntimeError(f"Supabase UPDATE {table}: HTTP {r.status_code} - {r.text[:2000]}")
+
+
+def supabase_select(table, params=None):
+    q = {"select": "*"}
+    if params:
+        q.update(params)
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=supabase_headers(),
+        params=q,
+        timeout=120,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Supabase SELECT {table}: HTTP {r.status_code} - {r.text[:2000]}")
+    return r.json()
+
+
+def supabase_delete_by_sale_ids(table, sale_ids):
+    ids = sorted({int(x) for x in sale_ids if x is not None})
+    if not ids:
+        return
+    for pos in range(0, len(ids), 100):
+        batch = ids[pos:pos + 100]
+        r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=supabase_headers("return=minimal"),
+            params={"sale_id": f"in.({','.join(str(x) for x in batch)})"},
+            timeout=120,
+        )
+        if r.status_code not in (200, 204):
+            raise RuntimeError(f"Supabase DELETE {table}: HTTP {r.status_code} - {r.text[:2000]}")
+
+
+def supabase_insert_rows(table, rows):
+    if not rows:
+        return
+    for pos in range(0, len(rows), 250):
+        supabase_insert(table, rows[pos:pos + 250], return_representation=False)
+
+
+def supabase_rows_by_sale_ids(table, sale_ids):
+    ids = sorted({int(x) for x in sale_ids if x is not None})
+    out = []
+    for pos in range(0, len(ids), 100):
+        batch = ids[pos:pos + 100]
+        out.extend(supabase_select(
+            table,
+            {"sale_id": f"in.({','.join(str(x) for x in batch)})"}
+        ))
+    return out
+
+
+def normalize_number(value):
+    if value in (None, ""):
+        return None
+    try:
+        d = Decimal(str(value))
+        if d == 0:
+            return "0"
+        return format(d.normalize(), "f")
+    except (InvalidOperation, ValueError, TypeError):
+        return value
+
+
+def canonical_row(row, fields):
+    numeric_fields = {
+        "total_amount", "paid_amount", "pending_amount", "giftcard_amount",
+        "price", "list_price", "discount", "quantity", "subtotal", "total",
+        "amount", "tip",
+    }
+    result = {}
+    for field in fields:
+        value = row.get(field)
+        if field in numeric_fields:
+            value = normalize_number(value)
+        result[field] = value
+    return result
+
+
+def canonical_rows(rows, fields):
+    values = [canonical_row(r, fields) for r in rows]
+    return sorted(values, key=lambda x: json.dumps(x, sort_keys=True, default=str, ensure_ascii=False))
+
+
+def log_change(sync_run_id, sale_id, location_id, business_date, change_type, old_value, new_value):
+    supabase_insert(
+        "agenda_change_log",
+        {
+            "sync_run_id": sync_run_id,
+            "sale_id": sale_id,
+            "location_id": location_id,
+            "business_date": business_date,
+            "change_type": change_type,
+            "old_value": old_value,
+            "new_value": new_value,
+        },
+        return_representation=False,
+    )
+
+
+def is_cancelled_status(status):
+    return (status or "").strip().lower() in CANCELLED_STATUSES
 
 
 def login_agendapro():
@@ -251,7 +383,7 @@ def fetch_v2_sale_detail(cookie_header, sale_id):
     return r.json()
 
 
-def build_special_sale(detail):
+def build_detail_sale(detail):
     return {
         "sale_id": int(detail["id"]),
         "internal_id": detail.get("internal_id"),
@@ -282,7 +414,7 @@ def build_special_sale(detail):
     }
 
 
-def build_special_items(detail):
+def build_detail_items(detail):
     rows = []
     sale_id = int(detail["id"])
     for idx, item in enumerate(detail.get("items") or []):
@@ -547,7 +679,7 @@ def build_transactions(transactions):
     return rows
 
 
-def run_one_day(cookie_header, location_id, day):
+def run_one_day(cookie_header, location_id, day, sync_run_id):
     payments = fetch_v1_payments(cookie_header, location_id, day)
     sales = fetch_v2_sales(cookie_header, location_id, day)
     transactions = fetch_v2_transactions(cookie_header, location_id, day)
@@ -578,20 +710,20 @@ def run_one_day(cookie_header, location_id, day):
             )
             continue
 
-        special_sale = build_special_sale(detail)
-        sale_rows.append(special_sale)
-        special_items = build_special_items(detail)
-        item_rows.extend(special_items)
-        special_item_rows.extend(special_items)
+        detail_sale = build_detail_sale(detail)
+        sale_rows.append(detail_sale)
+        detail_items = build_detail_items(detail)
+        item_rows.extend(detail_items)
+        special_item_rows.extend(detail_items)
         resolved_special_sales.append({
             "sale_id": orphan_sale_id,
-            "sale_type": special_sale["sale_type"],
-            "items": len(special_items),
+            "sale_type": detail_sale["sale_type"],
+            "items": len(detail_items),
         })
 
         log(
             f"Venta especial resuelta: sale_id={orphan_sale_id} "
-            f"tipo={special_sale['sale_type']} items={len(special_items)}"
+            f"tipo={detail_sale['sale_type']} items={len(detail_items)}"
         )
 
     if unresolved_transactions:
@@ -600,51 +732,158 @@ def run_one_day(cookie_header, location_id, day):
             f"{unresolved_transactions[:20]}"
         )
 
-    # Primero padres, luego hijos.
+    # PostgREST exige exactamente las mismas claves para todos los objetos del array.
+    item_rows = [{key: row.get(key) for key in ITEM_KEYS} for row in item_rows]
+
+    incoming_ids = {int(r["sale_id"]) for r in sale_rows}
+    now_iso = now_utc_iso()
+
+    # Estado previo de las ventas que llegaron hoy, aunque antes estuvieran en otra fecha.
+    previous_sales = supabase_rows_by_sale_ids("agenda_sales", incoming_ids)
+    previous_by_id = {int(r["sale_id"]): r for r in previous_sales}
+
+    # Estado previo de la fecha/local para detectar ventas que dejaron de aparecer.
+    existing_day_rows = supabase_select(
+        "agenda_sales",
+        {
+            "location_id": f"eq.{location_id}",
+            "business_date": f"eq.{day.isoformat()}",
+        },
+    )
+    existing_active_day_ids = {
+        int(r["sale_id"])
+        for r in existing_day_rows
+        if r.get("source_active") is not False
+    }
+
+    # Hijos previos: se usan para detectar cambios antes de reemplazarlos.
+    previous_items = supabase_rows_by_sale_ids("agenda_sale_items", incoming_ids)
+    previous_transactions = supabase_rows_by_sale_ids("agenda_payment_transactions", incoming_ids)
+
+    prev_items_by_sale = {}
+    for r in previous_items:
+        prev_items_by_sale.setdefault(int(r["sale_id"]), []).append(r)
+    prev_tx_by_sale = {}
+    for r in previous_transactions:
+        prev_tx_by_sale.setdefault(int(r["sale_id"]), []).append(r)
+
+    new_items_by_sale = {}
+    for r in item_rows:
+        new_items_by_sale.setdefault(int(r["sale_id"]), []).append(r)
+    new_tx_by_sale = {}
+    for r in transaction_rows:
+        new_tx_by_sale.setdefault(int(r["sale_id"]), []).append(r)
+
+    changes_detected = 0
+
+    # Auditoria de cabecera, items y transacciones.
+    for row in sale_rows:
+        sid = int(row["sale_id"])
+        old = previous_by_id.get(sid)
+        if old:
+            old_sale = canonical_row(old, SALE_COMPARE_FIELDS)
+            new_sale = canonical_row(row, SALE_COMPARE_FIELDS)
+            if old_sale != new_sale:
+                change_type = "sale_date_changed" if old.get("business_date") != row.get("business_date") else "sale_updated"
+                log_change(
+                    sync_run_id, sid, row.get("location_id"), row.get("business_date"),
+                    change_type, old_sale, new_sale,
+                )
+                changes_detected += 1
+
+            old_items = canonical_rows(prev_items_by_sale.get(sid, []), ITEM_COMPARE_FIELDS)
+            new_items = canonical_rows(new_items_by_sale.get(sid, []), ITEM_COMPARE_FIELDS)
+            if old_items != new_items:
+                log_change(
+                    sync_run_id, sid, row.get("location_id"), row.get("business_date"),
+                    "items_changed", old_items, new_items,
+                )
+                changes_detected += 1
+
+            old_tx = canonical_rows(prev_tx_by_sale.get(sid, []), TRANSACTION_COMPARE_FIELDS)
+            new_tx = canonical_rows(new_tx_by_sale.get(sid, []), TRANSACTION_COMPARE_FIELDS)
+            if old_tx != new_tx:
+                log_change(
+                    sync_run_id, sid, row.get("location_id"), row.get("business_date"),
+                    "transactions_changed", old_tx, new_tx,
+                )
+                changes_detected += 1
+
+            if old.get("source_active") is False:
+                log_change(
+                    sync_run_id, sid, row.get("location_id"), row.get("business_date"),
+                    "sale_reactivated", {"source_active": False}, {"source_active": True},
+                )
+                changes_detected += 1
+
+        row["source_active"] = not is_cancelled_status(row.get("status"))
+        row["last_seen_at"] = now_iso
+        row["source_missing_since"] = None
+
+    # Reemplazo completo de hijos de cada venta que vino de AgendaPro.
+    # Esto elimina servicios/transacciones viejos si fueron corregidos o borrados.
     supabase_upsert("agenda_sales", sale_rows, "sale_id")
+    supabase_delete_by_sale_ids("agenda_sale_items", incoming_ids)
+    supabase_delete_by_sale_ids("agenda_payment_transactions", incoming_ids)
+    supabase_insert_rows("agenda_sale_items", item_rows)
+    supabase_insert_rows("agenda_payment_transactions", transaction_rows)
 
-    item_keys = [
-        "booking_id",
-        "source_item_id",
-        "sale_id",
-        "payment_id",
-        "receipt_id",
-        "client_id",
-        "service_id",
-        "service_name",
-        "service_provider_id",
-        "service_provider_name",
-        "session_number",
-        "price",
-        "list_price",
-        "discount",
-        "item_type",
-        "product_name",
-        "quantity",
-        "seller_id",
-        "seller_type",
-        "item_name",
-        "subtotal",
-        "total",
-        "synced_at",
-    ]
+    # Ventas que estaban activas en esta fecha/local y ya no aparecen en el listado actual.
+    missing_ids = sorted(existing_active_day_ids - incoming_ids)
+    missing_marked = 0
+    missing_resolved = 0
 
-    item_rows = [
-        {key: row.get(key) for key in item_keys}
-        for row in item_rows
-    ]
+    for sid in missing_ids:
+        old = next((r for r in existing_day_rows if int(r["sale_id"]) == sid), None)
+        detail = fetch_v2_sale_detail(cookie_header, sid)
 
-    supabase_upsert(
-        "agenda_sale_items",
-        item_rows,
-        "item_type,source_item_id"
-    )
+        if detail:
+            detail_sale = build_detail_sale(detail)
+            detail_sale["source_active"] = not is_cancelled_status(detail_sale.get("status"))
+            detail_sale["last_seen_at"] = now_iso
+            detail_sale["source_missing_since"] = None
 
-    supabase_upsert(
-        "agenda_payment_transactions",
-        transaction_rows,
-        "transaction_id"
-    )
+            old_date = old.get("business_date") if old else None
+            new_date = detail_sale.get("business_date")
+            old_status = old.get("status") if old else None
+            new_status = detail_sale.get("status")
+
+            if old_date != new_date:
+                change_type = "sale_date_changed"
+            elif is_cancelled_status(new_status):
+                change_type = "sale_cancelled"
+            else:
+                change_type = "sale_updated"
+
+            log_change(
+                sync_run_id, sid, detail_sale.get("location_id") or location_id,
+                new_date or day.isoformat(), change_type,
+                canonical_row(old or {}, SALE_COMPARE_FIELDS),
+                canonical_row(detail_sale, SALE_COMPARE_FIELDS),
+            )
+            supabase_upsert("agenda_sales", [detail_sale], "sale_id")
+            changes_detected += 1
+            missing_resolved += 1
+            log(f"Venta ausente resuelta por detalle: sale_id={sid} tipo={change_type}")
+        else:
+            first_missing = (old or {}).get("source_missing_since") or now_iso
+            supabase_update(
+                "agenda_sales",
+                {"sale_id": sid},
+                {
+                    "source_active": False,
+                    "source_missing_since": first_missing,
+                },
+            )
+            log_change(
+                sync_run_id, sid, location_id, day.isoformat(), "sale_missing",
+                canonical_row(old or {}, SALE_COMPARE_FIELDS),
+                {"source_active": False, "source_missing_since": first_missing},
+            )
+            changes_detected += 1
+            missing_marked += 1
+            log(f"Venta ya no disponible en AgendaPro: sale_id={sid}")
+
     return {
         "payments": len(payments),
         "sales": len(sales) + len(resolved_special_sales),
@@ -662,12 +901,15 @@ def run_one_day(cookie_header, location_id, day):
         ),
         "mock_bookings": sum(1 for r in item_rows if r["item_type"] == "mock_booking"),
         "products": sum(1 for r in item_rows if r["item_type"] == "product"),
+        "changes_detected": changes_detected,
+        "missing_marked": missing_marked,
+        "missing_resolved": missing_resolved,
     }
 
 
 def main():
     today_arg = datetime.now(ARG_TZ).date()
-    start_day = today_arg - timedelta(days=DAYS_BACK)
+    start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
     end_day = today_arg
 
     run = supabase_insert(
@@ -678,7 +920,7 @@ def main():
             "date_to": end_day.isoformat(),
             "status": "running",
             "metadata": {
-                "mode": "manual_multilocal",
+                "mode": "manual_multilocal_reconciliation",
                 "source": "github-actions",
                 "locations": LOCATIONS,
             },
@@ -697,6 +939,9 @@ def main():
         "special_sales": 0,
         "days_processed": 0,
         "warnings": [],
+        "changes_detected": 0,
+        "missing_marked": 0,
+        "missing_resolved": 0,
     }
 
     try:
@@ -712,7 +957,7 @@ def main():
             log(f"--- Local {location_id} ---")
             day = start_day
             while day <= end_day:
-                summary = run_one_day(cookie_header, location_id, day)
+                summary = run_one_day(cookie_header, location_id, day, sync_run_id)
                 totals["sales"] += summary["sales"]
                 totals["items"] += summary["items"]
                 totals["transactions"] += summary["transactions"]
@@ -722,6 +967,9 @@ def main():
                 totals["giftcards"] += summary["giftcards"]
                 totals["special_sales"] += summary["special_sales"]
                 totals["days_processed"] += 1
+                totals["changes_detected"] += summary["changes_detected"]
+                totals["missing_marked"] += summary["missing_marked"]
+                totals["missing_resolved"] += summary["missing_resolved"]
 
                 warn_parts = []
                 if summary["missing_payments"]:
@@ -742,12 +990,13 @@ def main():
                 log(
                     f"{day.isoformat()} | sales={summary['sales']} | items={summary['items']} "
                     f"| trans={summary['transactions']} | mock={summary['mock_bookings']} "
-                    f"| products={summary['products']} | special={summary['special_sales']}"
+                    f"| products={summary['products']} | special={summary['special_sales']} "
+                    f"| changes={summary['changes_detected']} | missing={summary['missing_marked']}"
                 )
                 day += timedelta(days=1)
 
         metadata = {
-            "mode": "manual_multilocal",
+            "mode": "manual_multilocal_reconciliation",
             "source": "github-actions",
             "locations": LOCATIONS,
             "days_processed": totals["days_processed"],
@@ -756,6 +1005,9 @@ def main():
             "memberships_detected_not_loaded": totals["memberships"],
             "giftcards_loaded_or_detected": totals["giftcards"],
             "special_sales_resolved": totals["special_sales"],
+            "changes_detected": totals["changes_detected"],
+            "sales_marked_missing": totals["missing_marked"],
+            "missing_sales_resolved_by_detail": totals["missing_resolved"],
             "warnings": totals["warnings"][:100],
         }
 
@@ -785,6 +1037,9 @@ def main():
         log(f"Memberships detectados: {totals['memberships']}")
         log(f"Giftcards cargadas/detectadas: {totals['giftcards']}")
         log(f"Ventas especiales resueltas:  {totals['special_sales']}")
+        log(f"Cambios detectados: {totals['changes_detected']}")
+        log(f"Ventas marcadas ausentes: {totals['missing_marked']}")
+        log(f"Ausentes resueltas por detalle: {totals['missing_resolved']}")
         log(f"Warnings:      {len(totals['warnings'])}")
         log("========================================")
 
@@ -798,7 +1053,7 @@ def main():
                     "status": "error",
                     "error_message": str(exc)[:3000],
                     "metadata": {
-                        "mode": "manual_multilocal",
+                        "mode": "manual_multilocal_reconciliation",
                         "source": "github-actions",
                         "locations": LOCATIONS,
                     },

@@ -15,7 +15,8 @@ SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 
 ARG_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 UTC = timezone.utc
-ROLLING_DAYS = 14
+ROLLING_DAYS = 10
+SYNC_MODE = os.getenv("SYNC_MODE", "today").strip().lower()
 PER_PAGE = 100
 HTTP = requests.Session()
 
@@ -176,11 +177,11 @@ def supabase_delete_by_sale_ids(table, sale_ids):
             raise RuntimeError(f"Supabase DELETE {table}: HTTP {r.status_code} - {r.text[:2000]}")
 
 
-def supabase_insert_rows(table, rows):
+def supabase_insert_rows(table, rows, batch_size=250):
     if not rows:
         return
-    for pos in range(0, len(rows), 250):
-        supabase_insert(table, rows[pos:pos + 250], return_representation=False)
+    for pos in range(0, len(rows), batch_size):
+        supabase_insert(table, rows[pos:pos + batch_size], return_representation=False)
 
 
 def supabase_rows_by_sale_ids(table, sale_ids):
@@ -207,17 +208,57 @@ def normalize_number(value):
         return value
 
 
+def normalize_integer(value):
+    if value in (None, ""):
+        return None
+    try:
+        return str(int(Decimal(str(value))))
+    except (InvalidOperation, ValueError, TypeError):
+        return str(value)
+
+
+def normalize_timestamp(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return str(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    dt = dt.astimezone(UTC)
+    # AgendaPro y PostgREST representan el mismo instante con formatos distintos.
+    # Para comparar, normalizamos siempre a UTC sin depender de .000Z / +00:00.
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def canonical_row(row, fields):
     numeric_fields = {
         "total_amount", "paid_amount", "pending_amount", "giftcard_amount",
         "price", "list_price", "discount", "quantity", "subtotal", "total",
         "amount", "tip",
     }
+    integer_fields = {
+        "transaction_id", "sale_id", "booking_id", "source_item_id", "payment_id",
+        "receipt_id", "client_id", "service_id", "service_provider_id", "seller_id",
+        "session_number", "installments", "cart_id", "location_id",
+    }
+    timestamp_fields = {"paid_at_source"}
+
     result = {}
     for field in fields:
         value = row.get(field)
         if field in numeric_fields:
             value = normalize_number(value)
+        elif field in integer_fields:
+            value = normalize_integer(value)
+        elif field in timestamp_fields:
+            value = normalize_timestamp(value)
+        elif value == "":
+            value = None
         result[field] = value
     return result
 
@@ -227,21 +268,40 @@ def canonical_rows(rows, fields):
     return sorted(values, key=lambda x: json.dumps(x, sort_keys=True, default=str, ensure_ascii=False))
 
 
-def log_change(sync_run_id, sale_id, location_id, business_date, change_type, old_value, new_value):
-    supabase_insert(
-        "agenda_change_log",
-        {
-            "sync_run_id": sync_run_id,
-            "sale_id": sale_id,
-            "location_id": location_id,
-            "business_date": business_date,
-            "change_type": change_type,
-            "old_value": old_value,
-            "new_value": new_value,
-        },
-        return_representation=False,
-    )
+def queue_change(change_rows, sync_run_id, sale_id, location_id, business_date,
+                 change_type, old_value, new_value):
+    change_rows.append({
+        "sync_run_id": sync_run_id,
+        "sale_id": sale_id,
+        "location_id": location_id,
+        "business_date": business_date,
+        "change_type": change_type,
+        "old_value": old_value,
+        "new_value": new_value,
+    })
 
+
+def compact_diff_fields(old_row, new_row):
+    keys = sorted(set(old_row) | set(new_row))
+    return [k for k in keys if old_row.get(k) != new_row.get(k)]
+
+
+def log_compare_sample(kind, sale_id, old_value, new_value, max_chars=1200):
+    """Muestra una muestra compacta si queda algun falso positivo por diagnosticar."""
+    try:
+        if isinstance(old_value, dict) and isinstance(new_value, dict):
+            fields = compact_diff_fields(old_value, new_value)
+            log(f"Muestra diferencia {kind} sale_id={sale_id}: campos={fields}")
+            return
+
+        old_json = json.dumps(old_value, ensure_ascii=False, sort_keys=True, default=str)
+        new_json = json.dumps(new_value, ensure_ascii=False, sort_keys=True, default=str)
+        log(
+            f"Muestra diferencia {kind} sale_id={sale_id}: "
+            f"old={old_json[:max_chars]} | new={new_json[:max_chars]}"
+        )
+    except Exception:
+        pass
 
 def is_cancelled_status(status):
     return (status or "").strip().lower() in CANCELLED_STATUSES
@@ -703,6 +763,8 @@ def build_transactions(transactions):
 
 
 def run_window(cookie_header, start_day, end_day, sync_run_id):
+    change_log_rows = []
+    sample_counts = {"sale": 0, "items": 0, "transactions": 0}
     log("Leyendo AgendaPro en bloque para todos los locales...")
     payments = fetch_v1_payments_window(cookie_header, start_day, end_day)
     sales = fetch_v2_sales_window(cookie_header, start_day, end_day)
@@ -824,12 +886,15 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
             old_sale = canonical_row(old, SALE_COMPARE_FIELDS)
             new_sale = canonical_row(row, SALE_COMPARE_FIELDS)
             if old_sale != new_sale:
+                if sample_counts["sale"] < 3:
+                    log_compare_sample("sale", sid, old_sale, new_sale)
+                    sample_counts["sale"] += 1
                 change_type = (
                     "sale_date_changed"
                     if old.get("business_date") != row.get("business_date")
                     else "sale_updated"
                 )
-                log_change(
+                queue_change(change_log_rows, 
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     change_type, old_sale, new_sale,
                 )
@@ -838,8 +903,11 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
             old_items = canonical_rows(prev_items_by_sale.get(sid, []), ITEM_COMPARE_FIELDS)
             new_items = canonical_rows(new_items_by_sale.get(sid, []), ITEM_COMPARE_FIELDS)
             if old_items != new_items:
+                if sample_counts["items"] < 3:
+                    log_compare_sample("items", sid, old_items, new_items)
+                    sample_counts["items"] += 1
                 changed_item_sale_ids.add(sid)
-                log_change(
+                queue_change(change_log_rows, 
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     "items_changed", old_items, new_items,
                 )
@@ -848,15 +916,18 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
             old_tx = canonical_rows(prev_tx_by_sale.get(sid, []), TRANSACTION_COMPARE_FIELDS)
             new_tx = canonical_rows(new_tx_by_sale.get(sid, []), TRANSACTION_COMPARE_FIELDS)
             if old_tx != new_tx:
+                if sample_counts["transactions"] < 3:
+                    log_compare_sample("transactions", sid, old_tx, new_tx)
+                    sample_counts["transactions"] += 1
                 changed_tx_sale_ids.add(sid)
-                log_change(
+                queue_change(change_log_rows, 
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     "transactions_changed", old_tx, new_tx,
                 )
                 changes_detected += 1
 
             if old.get("source_active") is False:
-                log_change(
+                queue_change(change_log_rows, 
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     "sale_reactivated", {"source_active": False}, {"source_active": True},
                 )
@@ -916,7 +987,7 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
             else:
                 change_type = "sale_updated"
 
-            log_change(
+            queue_change(change_log_rows, 
                 sync_run_id, sid, detail_sale.get("location_id"), new_date or old_date,
                 change_type, canonical_row(old or {}, SALE_COMPARE_FIELDS),
                 canonical_row(detail_sale, SALE_COMPARE_FIELDS),
@@ -939,7 +1010,7 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
                 {"sale_id": sid},
                 {"source_active": False, "source_missing_since": first_missing},
             )
-            log_change(
+            queue_change(change_log_rows, 
                 sync_run_id, sid, (old or {}).get("location_id"),
                 (old or {}).get("business_date"), "sale_missing",
                 canonical_row(old or {}, SALE_COMPARE_FIELDS),
@@ -948,6 +1019,9 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
             changes_detected += 1
             missing_marked += 1
             log(f"Venta ya no disponible en AgendaPro: sale_id={sid}")
+
+    # La auditoria se inserta en lotes; nunca una llamada HTTP por cambio.
+    supabase_insert_rows("agenda_change_log", change_log_rows, batch_size=50)
 
     return {
         "payments": len(payments),
@@ -975,8 +1049,19 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
 def main():
     started = time.time()
     today_arg = datetime.now(ARG_TZ).date()
-    start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
-    end_day = today_arg
+
+    if SYNC_MODE == "today":
+        start_day = today_arg
+        end_day = today_arg
+        mode_label = "today"
+    elif SYNC_MODE == "rolling":
+        start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
+        end_day = today_arg
+        mode_label = f"rolling_{ROLLING_DAYS}_days"
+    else:
+        raise RuntimeError(
+            f"SYNC_MODE invalido: {SYNC_MODE}. Valores permitidos: today, rolling"
+        )
 
     run = supabase_insert(
         "agenda_sync_runs",
@@ -986,10 +1071,10 @@ def main():
             "date_to": end_day.isoformat(),
             "status": "running",
             "metadata": {
-                "mode": "manual_multilocal_reconciliation_v4",
+                "mode": f"reconciliation_v5_{mode_label}",
                 "source": "github-actions",
                 "locations": LOCATIONS,
-                "strategy": "single_window_all_locations",
+                "strategy": "single_window_all_locations_batch_audit",
             },
         },
     )
@@ -998,7 +1083,8 @@ def main():
     try:
         cookie_header = login_agendapro()
         log("\n========================================")
-        log("SYNC OPTIMIZADO AGENDA PRO -> NIKI OS V4")
+        log("SYNC AGENDA PRO -> NIKI OS V5")
+        log(f"Modo: {mode_label}")
         log(f"Desde: {start_day}")
         log(f"Hasta: {end_day}")
         log(f"Locales: {len(LOCATIONS)} (en una sola ventana)")
@@ -1016,10 +1102,10 @@ def main():
             warnings.append(f"memberships={summary['memberships']}")
 
         metadata = {
-            "mode": "manual_multilocal_reconciliation_v4",
+            "mode": f"reconciliation_v5_{mode_label}",
             "source": "github-actions",
             "locations": LOCATIONS,
-            "strategy": "single_window_all_locations",
+            "strategy": "single_window_all_locations_batch_audit",
             "elapsed_seconds": elapsed,
             "mock_bookings": summary["mock_bookings"],
             "products": summary["products"],
@@ -1052,7 +1138,7 @@ def main():
         )
 
         log("\n========================================")
-        log("SYNC OPTIMIZADO OK")
+        log("SYNC V5 OK")
         log(f"Ventas leidas:          {summary['sales']}")
         log(f"Items leidos:           {summary['items']}")
         log(f"Transacciones leidas:   {summary['transactions']}")
@@ -1063,6 +1149,7 @@ def main():
         log(f"Cambios detectados:     {summary['changes_detected']}")
         log(f"Missing marcadas:       {summary['missing_marked']}")
         log(f"Missing resueltas:      {summary['missing_resolved']}")
+        log(f"Modo:                   {mode_label}")
         log(f"Tiempo total:           {elapsed} segundos")
         log("========================================")
 
@@ -1075,7 +1162,7 @@ def main():
                     "finished_at": now_utc_iso(),
                     "status": "error",
                     "metadata": {
-                        "mode": "manual_multilocal_reconciliation_v4",
+                        "mode": f"reconciliation_v5_{mode_label}",
                         "error": str(exc)[:3000],
                     },
                 },

@@ -1,12 +1,30 @@
-name: Sync Niki AgendaPro Manual
+name: Sync Niki AgendaPro
 
 on:
   workflow_dispatch:
+    inputs:
+      sync_mode:
+        description: "Modo de sincronización"
+        required: true
+        default: "today"
+        type: choice
+        options:
+          - today
+          - rolling
+
+  schedule:
+    # Durante el día: cada hora de 08:15 a 23:15
+    - cron: "15 8-23 * * *"
+      timezone: "America/Argentina/Buenos_Aires"
+
+    # Reconciliación nocturna: últimos 10 días
+    - cron: "30 3 * * *"
+      timezone: "America/Argentina/Buenos_Aires"
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repo
@@ -22,6 +40,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install playwright requests
           python -m playwright install --with-deps chromium
+
+      - name: Resolve sync mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SYNC_MODE="${{ inputs.sync_mode }}"
+          elif [ "${{ github.event.schedule }}" = "30 3 * * *" ]; then
+            SYNC_MODE="rolling"
+          else
+            SYNC_MODE="today"
+          fi
+
+          echo "SYNC_MODE=$SYNC_MODE" >> "$GITHUB_ENV"
+          echo "Modo de sincronización: $SYNC_MODE"
 
       - name: Run AgendaPro multilocal sync
         env:

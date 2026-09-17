@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -200,10 +200,17 @@ def normalize_number(value):
     if value in (None, ""):
         return None
     try:
-        d = Decimal(str(value))
+        # Supabase devuelve estos numeric con hasta 6 decimales. AgendaPro puede
+        # traer el mismo valor como float con mas precision binaria (por ejemplo,
+        # 9.999999999999998 en lugar de 10). Para comparar, llevamos ambos lados
+        # a la misma precision y evitamos falsos cambios.
+        d = Decimal(str(value)).quantize(
+            Decimal("0.000001"),
+            rounding=ROUND_HALF_UP,
+        )
         if d == 0:
             return "0"
-        return format(d.normalize(), "f")
+        return format(d, "f").rstrip("0").rstrip(".")
     except (InvalidOperation, ValueError, TypeError):
         return value
 
@@ -1083,7 +1090,7 @@ def main():
     try:
         cookie_header = login_agendapro()
         log("\n========================================")
-        log("SYNC AGENDA PRO -> NIKI OS V5")
+        log("SYNC AGENDA PRO -> NIKI OS V5.1")
         log(f"Modo: {mode_label}")
         log(f"Desde: {start_day}")
         log(f"Hasta: {end_day}")
@@ -1138,7 +1145,7 @@ def main():
         )
 
         log("\n========================================")
-        log("SYNC V5 OK")
+        log("SYNC V5.1 OK")
         log(f"Ventas leidas:          {summary['sales']}")
         log(f"Items leidos:           {summary['items']}")
         log(f"Transacciones leidas:   {summary['transactions']}")

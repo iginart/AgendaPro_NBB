@@ -17,6 +17,7 @@ ARG_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 UTC = timezone.utc
 ROLLING_DAYS = 14
 PER_PAGE = 100
+HTTP = requests.Session()
 
 LOCATIONS = [
     311450,
@@ -108,7 +109,7 @@ def supabase_headers(prefer=None):
 
 def supabase_insert(table, payload, return_representation=True):
     prefer = "return=representation" if return_representation else "return=minimal"
-    r = requests.post(
+    r = HTTP.post(
         f"{SUPABASE_URL}/rest/v1/{table}",
         headers=supabase_headers(prefer),
         json=payload,
@@ -122,7 +123,7 @@ def supabase_insert(table, payload, return_representation=True):
 def supabase_upsert(table, rows, on_conflict):
     if not rows:
         return
-    r = requests.post(
+    r = HTTP.post(
         f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}",
         headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
         json=rows,
@@ -134,7 +135,7 @@ def supabase_upsert(table, rows, on_conflict):
 
 def supabase_update(table, filters, values):
     qs = "&".join(f"{k}=eq.{v}" for k, v in filters.items())
-    r = requests.patch(
+    r = HTTP.patch(
         f"{SUPABASE_URL}/rest/v1/{table}?{qs}",
         headers=supabase_headers("return=minimal"),
         json=values,
@@ -148,7 +149,7 @@ def supabase_select(table, params=None):
     q = {"select": "*"}
     if params:
         q.update(params)
-    r = requests.get(
+    r = HTTP.get(
         f"{SUPABASE_URL}/rest/v1/{table}",
         headers=supabase_headers(),
         params=q,
@@ -165,7 +166,7 @@ def supabase_delete_by_sale_ids(table, sale_ids):
         return
     for pos in range(0, len(ids), 100):
         batch = ids[pos:pos + 100]
-        r = requests.delete(
+        r = HTTP.delete(
             f"{SUPABASE_URL}/rest/v1/{table}",
             headers=supabase_headers("return=minimal"),
             params={"sale_id": f"in.({','.join(str(x) for x in batch)})"},
@@ -185,8 +186,8 @@ def supabase_insert_rows(table, rows):
 def supabase_rows_by_sale_ids(table, sale_ids):
     ids = sorted({int(x) for x in sale_ids if x is not None})
     out = []
-    for pos in range(0, len(ids), 100):
-        batch = ids[pos:pos + 100]
+    for pos in range(0, len(ids), 200):
+        batch = ids[pos:pos + 200]
         out.extend(supabase_select(
             table,
             {"sale_id": f"in.({','.join(str(x) for x in batch)})"}
@@ -284,7 +285,7 @@ def login_agendapro():
 
 
 def agenda_get(url, cookie_header):
-    r = requests.get(
+    r = HTTP.get(
         url,
         headers={
             "Cookie": cookie_header,
@@ -298,58 +299,79 @@ def agenda_get(url, cookie_header):
     return r.json()
 
 
-def fetch_v1_payments(cookie_header, location_id, day):
-    day_dmy = day.strftime("%d-%m-%Y")
+def _dedupe_by_id(rows, key="id"):
+    out = {}
+    for row in rows:
+        value = row.get(key)
+        if value is not None:
+            out[int(value)] = row
+    return list(out.values())
+
+
+def fetch_v1_payments_window(cookie_header, start_day, end_day):
+    from_dmy = start_day.strftime("%d-%m-%Y")
+    to_dmy = end_day.strftime("%d-%m-%Y")
+    locations_csv = ",".join(str(x) for x in LOCATIONS)
     all_rows = []
     page = 1
     while True:
         url = (
             "https://agendapro.com/api/views/admin/v1/payments"
-            f"?from={day_dmy}&to={day_dmy}&per_page={PER_PAGE}"
-            f"&location_ids={location_id}&page={page}"
+            f"?from={from_dmy}&to={to_dmy}&per_page={PER_PAGE}"
+            f"&location_ids={locations_csv}&page={page}"
         )
         data = agenda_get(url, cookie_header)
         rows = data.get("payments") or []
         all_rows.extend(rows)
         pages = int(data.get("pages") or 1)
+        log(f"payments pagina {page}/{pages}: {len(rows)}")
         if page >= pages:
             break
         page += 1
-    return all_rows
+    return _dedupe_by_id(all_rows)
 
 
-def fetch_v2_sales(cookie_header, location_id, day):
-    date_iso = day.strftime("%Y-%m-%d")
+def _v2_locations_query():
+    return "&".join(f"location_id[]={location_id}" for location_id in LOCATIONS)
+
+
+def fetch_v2_sales_window(cookie_header, start_day, end_day):
+    start_iso = start_day.strftime("%Y-%m-%d")
+    end_iso = end_day.strftime("%Y-%m-%d")
+    locations_qs = _v2_locations_query()
     all_rows = []
     page = 1
     while True:
         url = (
             "https://agendapro.com/api/views/admin/v2/sales/sale"
             f"?per_page={PER_PAGE}&page={page}"
-            f"&end_date={date_iso}T23:59:59-03:00"
-            f"&start_date={date_iso}T00:00:00-03:00"
-            f"&location_id[]={location_id}"
+            f"&end_date={end_iso}T23:59:59-03:00"
+            f"&start_date={start_iso}T00:00:00-03:00"
+            f"&{locations_qs}"
         )
         data = agenda_get(url, cookie_header)
         rows = data.get("data") or []
         all_rows.extend(rows)
         pages = int((data.get("pagination") or {}).get("total_pages") or 1)
+        log(f"sales pagina {page}/{pages}: {len(rows)}")
         if page >= pages:
             break
         page += 1
-    return all_rows
+    return _dedupe_by_id(all_rows)
 
 
-def fetch_v2_transactions(cookie_header, location_id, day):
-    date_iso = day.strftime("%Y-%m-%d")
+def fetch_v2_transactions_window(cookie_header, start_day, end_day):
+    start_iso = start_day.strftime("%Y-%m-%d")
+    end_iso = end_day.strftime("%Y-%m-%d")
+    locations_qs = _v2_locations_query()
     all_rows = []
     page = 1
     while True:
         url = (
             "https://agendapro.com/api/views/admin/v2/sales/transaction"
-            f"?end_date={date_iso}T23:59:59-03:00"
-            f"&start_date={date_iso}T00:00:00-03:00"
-            f"&location_id[]={location_id}"
+            f"?end_date={end_iso}T23:59:59-03:00"
+            f"&start_date={start_iso}T00:00:00-03:00"
+            f"&{locations_qs}"
             "&sale_id=&external_reference="
             f"&page={page}&per_page={PER_PAGE}"
         )
@@ -357,15 +379,16 @@ def fetch_v2_transactions(cookie_header, location_id, day):
         rows = data.get("data") or []
         all_rows.extend(rows)
         pages = int((data.get("pagination") or {}).get("total_pages") or 1)
+        log(f"transactions pagina {page}/{pages}: {len(rows)}")
         if page >= pages:
             break
         page += 1
-    return all_rows
+    return _dedupe_by_id(all_rows)
 
 
 def fetch_v2_sale_detail(cookie_header, sale_id):
     url = f"https://agendapro.com/api/views/admin/v2/sales/sale/{sale_id}"
-    r = requests.get(
+    r = HTTP.get(
         url,
         headers={
             "Cookie": cookie_header,
@@ -679,17 +702,23 @@ def build_transactions(transactions):
     return rows
 
 
-def run_one_day(cookie_header, location_id, day, sync_run_id):
-    payments = fetch_v1_payments(cookie_header, location_id, day)
-    sales = fetch_v2_sales(cookie_header, location_id, day)
-    transactions = fetch_v2_transactions(cookie_header, location_id, day)
+def run_window(cookie_header, start_day, end_day, sync_run_id):
+    log("Leyendo AgendaPro en bloque para todos los locales...")
+    payments = fetch_v1_payments_window(cookie_header, start_day, end_day)
+    sales = fetch_v2_sales_window(cookie_header, start_day, end_day)
+    transactions = fetch_v2_transactions_window(cookie_header, start_day, end_day)
+
+    log(
+        f"Origen: payments={len(payments)} | sales={len(sales)} | "
+        f"transactions={len(transactions)}"
+    )
 
     sale_rows, missing_payments = build_sales(sales, payments)
     item_rows, payments_without_sale, memberships, giftcards = build_items(sales, payments)
     transaction_rows = build_transactions(transactions)
 
-    sale_ids = {r["sale_id"] for r in sale_rows}
-    orphan_transactions = sorted({r["sale_id"] for r in transaction_rows} - sale_ids)
+    sale_ids = {int(r["sale_id"]) for r in sale_rows}
+    orphan_transactions = sorted({int(r["sale_id"]) for r in transaction_rows} - sale_ids)
 
     resolved_special_sales = []
     unresolved_transactions = []
@@ -702,11 +731,11 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
             continue
 
         detail_location = detail.get("location_id")
-        if detail_location is not None and int(detail_location) != int(location_id):
+        if detail_location is not None and int(detail_location) not in LOCATIONS:
             unresolved_transactions.append(orphan_sale_id)
             log(
-                f"WARNING sale especial {orphan_sale_id}: local detalle={detail_location}, "
-                f"local esperado={location_id}"
+                f"WARNING sale especial {orphan_sale_id}: "
+                f"local detalle={detail_location} fuera del conjunto sincronizado"
             )
             continue
 
@@ -720,7 +749,6 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
             "sale_type": detail_sale["sale_type"],
             "items": len(detail_items),
         })
-
         log(
             f"Venta especial resuelta: sale_id={orphan_sale_id} "
             f"tipo={detail_sale['sale_type']} items={len(detail_items)}"
@@ -728,35 +756,44 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
 
     if unresolved_transactions:
         raise RuntimeError(
-            f"Local {location_id} {day.isoformat()}: transacciones no resueltas "
-            f"{unresolved_transactions[:20]}"
+            "Transacciones no resueltas: " + str(unresolved_transactions[:20])
         )
 
-    # PostgREST exige exactamente las mismas claves para todos los objetos del array.
+    # PostgREST exige las mismas claves para todos los objetos del array.
     item_rows = [{key: row.get(key) for key in ITEM_KEYS} for row in item_rows]
+
+    # Deduplicacion defensiva por claves naturales.
+    sale_rows = list({int(r["sale_id"]): r for r in sale_rows}.values())
+    transaction_rows = list({int(r["transaction_id"]): r for r in transaction_rows}.values())
+    item_unique = {}
+    for r in item_rows:
+        key = (r.get("item_type"), r.get("source_item_id"), r.get("sale_id"))
+        item_unique[key] = r
+    item_rows = list(item_unique.values())
 
     incoming_ids = {int(r["sale_id"]) for r in sale_rows}
     now_iso = now_utc_iso()
 
-    # Estado previo de las ventas que llegaron hoy, aunque antes estuvieran en otra fecha.
-    previous_sales = supabase_rows_by_sale_ids("agenda_sales", incoming_ids)
-    previous_by_id = {int(r["sale_id"]): r for r in previous_sales}
-
-    # Estado previo de la fecha/local para detectar ventas que dejaron de aparecer.
-    existing_day_rows = supabase_select(
+    # Una sola lectura de cabeceras para toda la ventana y todos los locales.
+    locations_csv = ",".join(str(x) for x in LOCATIONS)
+    existing_window_rows = supabase_select(
         "agenda_sales",
         {
-            "location_id": f"eq.{location_id}",
-            "business_date": f"eq.{day.isoformat()}",
+            "location_id": f"in.({locations_csv})",
+            "and": (
+                f"(business_date.gte.{start_day.isoformat()},"
+                f"business_date.lte.{end_day.isoformat()})"
+            ),
         },
     )
-    existing_active_day_ids = {
-        int(r["sale_id"])
-        for r in existing_day_rows
-        if r.get("source_active") is not False
-    }
+    existing_window_by_id = {int(r["sale_id"]): r for r in existing_window_rows}
 
-    # Hijos previos: se usan para detectar cambios antes de reemplazarlos.
+    # Ventas entrantes que antes pudieron estar fuera de la ventana.
+    missing_previous_ids = incoming_ids - set(existing_window_by_id)
+    previous_outside = supabase_rows_by_sale_ids("agenda_sales", missing_previous_ids)
+    previous_by_id = dict(existing_window_by_id)
+    previous_by_id.update({int(r["sale_id"]): r for r in previous_outside})
+
     previous_items = supabase_rows_by_sale_ids("agenda_sale_items", incoming_ids)
     previous_transactions = supabase_rows_by_sale_ids("agenda_payment_transactions", incoming_ids)
 
@@ -775,16 +812,23 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
         new_tx_by_sale.setdefault(int(r["sale_id"]), []).append(r)
 
     changes_detected = 0
+    changed_item_sale_ids = set()
+    changed_tx_sale_ids = set()
+    new_sale_ids = set()
 
-    # Auditoria de cabecera, items y transacciones.
     for row in sale_rows:
         sid = int(row["sale_id"])
         old = previous_by_id.get(sid)
+
         if old:
             old_sale = canonical_row(old, SALE_COMPARE_FIELDS)
             new_sale = canonical_row(row, SALE_COMPARE_FIELDS)
             if old_sale != new_sale:
-                change_type = "sale_date_changed" if old.get("business_date") != row.get("business_date") else "sale_updated"
+                change_type = (
+                    "sale_date_changed"
+                    if old.get("business_date") != row.get("business_date")
+                    else "sale_updated"
+                )
                 log_change(
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     change_type, old_sale, new_sale,
@@ -794,6 +838,7 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
             old_items = canonical_rows(prev_items_by_sale.get(sid, []), ITEM_COMPARE_FIELDS)
             new_items = canonical_rows(new_items_by_sale.get(sid, []), ITEM_COMPARE_FIELDS)
             if old_items != new_items:
+                changed_item_sale_ids.add(sid)
                 log_change(
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     "items_changed", old_items, new_items,
@@ -803,6 +848,7 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
             old_tx = canonical_rows(prev_tx_by_sale.get(sid, []), TRANSACTION_COMPARE_FIELDS)
             new_tx = canonical_rows(new_tx_by_sale.get(sid, []), TRANSACTION_COMPARE_FIELDS)
             if old_tx != new_tx:
+                changed_tx_sale_ids.add(sid)
                 log_change(
                     sync_run_id, sid, row.get("location_id"), row.get("business_date"),
                     "transactions_changed", old_tx, new_tx,
@@ -815,26 +861,42 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
                     "sale_reactivated", {"source_active": False}, {"source_active": True},
                 )
                 changes_detected += 1
+        else:
+            new_sale_ids.add(sid)
+            changed_item_sale_ids.add(sid)
+            changed_tx_sale_ids.add(sid)
 
         row["source_active"] = not is_cancelled_status(row.get("status"))
         row["last_seen_at"] = now_iso
         row["source_missing_since"] = None
 
-    # Reemplazo completo de hijos de cada venta que vino de AgendaPro.
-    # Esto elimina servicios/transacciones viejos si fueron corregidos o borrados.
-    supabase_upsert("agenda_sales", sale_rows, "sale_id")
-    supabase_delete_by_sale_ids("agenda_sale_items", incoming_ids)
-    supabase_delete_by_sale_ids("agenda_payment_transactions", incoming_ids)
-    supabase_insert_rows("agenda_sale_items", item_rows)
-    supabase_insert_rows("agenda_payment_transactions", transaction_rows)
+    # Cabeceras siempre se actualizan para refrescar last_seen_at.
+    for pos in range(0, len(sale_rows), 250):
+        supabase_upsert("agenda_sales", sale_rows[pos:pos + 250], "sale_id")
 
-    # Ventas que estaban activas en esta fecha/local y ya no aparecen en el listado actual.
-    missing_ids = sorted(existing_active_day_ids - incoming_ids)
+    # Hijos solo se reemplazan cuando realmente cambiaron o la venta es nueva.
+    if changed_item_sale_ids:
+        supabase_delete_by_sale_ids("agenda_sale_items", changed_item_sale_ids)
+        changed_items = [r for r in item_rows if int(r["sale_id"]) in changed_item_sale_ids]
+        supabase_insert_rows("agenda_sale_items", changed_items)
+
+    if changed_tx_sale_ids:
+        supabase_delete_by_sale_ids("agenda_payment_transactions", changed_tx_sale_ids)
+        changed_tx = [r for r in transaction_rows if int(r["sale_id"]) in changed_tx_sale_ids]
+        supabase_insert_rows("agenda_payment_transactions", changed_tx)
+
+    # Ventas activas que estaban dentro de la ventana pero ya no aparecen en la API actual.
+    existing_active_ids = {
+        int(r["sale_id"])
+        for r in existing_window_rows
+        if r.get("source_active") is not False
+    }
+    missing_ids = sorted(existing_active_ids - incoming_ids)
     missing_marked = 0
     missing_resolved = 0
 
     for sid in missing_ids:
-        old = next((r for r in existing_day_rows if int(r["sale_id"]) == sid), None)
+        old = existing_window_by_id.get(sid)
         detail = fetch_v2_sale_detail(cookie_header, sid)
 
         if detail:
@@ -845,7 +907,6 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
 
             old_date = old.get("business_date") if old else None
             new_date = detail_sale.get("business_date")
-            old_status = old.get("status") if old else None
             new_status = detail_sale.get("status")
 
             if old_date != new_date:
@@ -856,12 +917,18 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
                 change_type = "sale_updated"
 
             log_change(
-                sync_run_id, sid, detail_sale.get("location_id") or location_id,
-                new_date or day.isoformat(), change_type,
-                canonical_row(old or {}, SALE_COMPARE_FIELDS),
+                sync_run_id, sid, detail_sale.get("location_id"), new_date or old_date,
+                change_type, canonical_row(old or {}, SALE_COMPARE_FIELDS),
                 canonical_row(detail_sale, SALE_COMPARE_FIELDS),
             )
             supabase_upsert("agenda_sales", [detail_sale], "sale_id")
+
+            # El detalle puede traer items especiales; si los trae, reemplazarlos.
+            detail_items = [{key: row.get(key) for key in ITEM_KEYS} for row in build_detail_items(detail)]
+            if detail_items:
+                supabase_delete_by_sale_ids("agenda_sale_items", [sid])
+                supabase_insert_rows("agenda_sale_items", detail_items)
+
             changes_detected += 1
             missing_resolved += 1
             log(f"Venta ausente resuelta por detalle: sale_id={sid} tipo={change_type}")
@@ -870,13 +937,11 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
             supabase_update(
                 "agenda_sales",
                 {"sale_id": sid},
-                {
-                    "source_active": False,
-                    "source_missing_since": first_missing,
-                },
+                {"source_active": False, "source_missing_since": first_missing},
             )
             log_change(
-                sync_run_id, sid, location_id, day.isoformat(), "sale_missing",
+                sync_run_id, sid, (old or {}).get("location_id"),
+                (old or {}).get("business_date"), "sale_missing",
                 canonical_row(old or {}, SALE_COMPARE_FIELDS),
                 {"source_active": False, "source_missing_since": first_missing},
             )
@@ -886,28 +951,29 @@ def run_one_day(cookie_header, location_id, day, sync_run_id):
 
     return {
         "payments": len(payments),
-        "sales": len(sales) + len(resolved_special_sales),
+        "sales": len(sale_rows),
         "regular_sales": len(sales),
         "special_sales": len(resolved_special_sales),
-        "transactions": len(transactions),
+        "transactions": len(transaction_rows),
         "items": len(item_rows),
         "missing_payments": len(missing_payments),
         "payments_without_sale": len(payments_without_sale),
         "orphan_transactions": len(orphan_transactions),
-        "resolved_special_sales": len(resolved_special_sales),
         "memberships": memberships,
-        "giftcards": giftcards + sum(
-            1 for r in special_item_rows if r["item_type"] == "giftcard"
-        ),
+        "giftcards": giftcards + sum(1 for r in special_item_rows if r["item_type"] == "giftcard"),
         "mock_bookings": sum(1 for r in item_rows if r["item_type"] == "mock_booking"),
         "products": sum(1 for r in item_rows if r["item_type"] == "product"),
         "changes_detected": changes_detected,
         "missing_marked": missing_marked,
         "missing_resolved": missing_resolved,
+        "changed_item_sales": len(changed_item_sale_ids),
+        "changed_transaction_sales": len(changed_tx_sale_ids),
+        "new_sales": len(new_sale_ids),
     }
 
 
 def main():
+    started = time.time()
     today_arg = datetime.now(ARG_TZ).date()
     start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
     end_day = today_arg
@@ -920,95 +986,53 @@ def main():
             "date_to": end_day.isoformat(),
             "status": "running",
             "metadata": {
-                "mode": "manual_multilocal_reconciliation",
+                "mode": "manual_multilocal_reconciliation_v4",
                 "source": "github-actions",
                 "locations": LOCATIONS,
+                "strategy": "single_window_all_locations",
             },
         },
     )
     sync_run_id = run[0]["id"]
 
-    totals = {
-        "sales": 0,
-        "items": 0,
-        "transactions": 0,
-        "mock_bookings": 0,
-        "products": 0,
-        "memberships": 0,
-        "giftcards": 0,
-        "special_sales": 0,
-        "days_processed": 0,
-        "warnings": [],
-        "changes_detected": 0,
-        "missing_marked": 0,
-        "missing_resolved": 0,
-    }
-
     try:
         cookie_header = login_agendapro()
         log("\n========================================")
-        log("SYNC MANUAL AGENDA PRO -> NIKI OS")
+        log("SYNC OPTIMIZADO AGENDA PRO -> NIKI OS V4")
         log(f"Desde: {start_day}")
         log(f"Hasta: {end_day}")
-        log(f"Locales: {len(LOCATIONS)}")
+        log(f"Locales: {len(LOCATIONS)} (en una sola ventana)")
         log("========================================\n")
 
-        for location_id in LOCATIONS:
-            log(f"--- Local {location_id} ---")
-            day = start_day
-            while day <= end_day:
-                summary = run_one_day(cookie_header, location_id, day, sync_run_id)
-                totals["sales"] += summary["sales"]
-                totals["items"] += summary["items"]
-                totals["transactions"] += summary["transactions"]
-                totals["mock_bookings"] += summary["mock_bookings"]
-                totals["products"] += summary["products"]
-                totals["memberships"] += summary["memberships"]
-                totals["giftcards"] += summary["giftcards"]
-                totals["special_sales"] += summary["special_sales"]
-                totals["days_processed"] += 1
-                totals["changes_detected"] += summary["changes_detected"]
-                totals["missing_marked"] += summary["missing_marked"]
-                totals["missing_resolved"] += summary["missing_resolved"]
+        summary = run_window(cookie_header, start_day, end_day, sync_run_id)
+        elapsed = round(time.time() - started, 1)
 
-                warn_parts = []
-                if summary["missing_payments"]:
-                    warn_parts.append(f"sales_sin_payment={summary['missing_payments']}")
-                if summary["payments_without_sale"]:
-                    warn_parts.append(f"payments_sin_sale={summary['payments_without_sale']}")
-                if summary["memberships"]:
-                    warn_parts.append(f"memberships={summary['memberships']}")
-                if summary["giftcards"]:
-                    warn_parts.append(f"giftcards={summary['giftcards']}")
-                if summary["special_sales"]:
-                    warn_parts.append(f"ventas_especiales={summary['special_sales']}")
-                if warn_parts:
-                    totals["warnings"].append(
-                        f"{location_id} {day.isoformat()}: " + ", ".join(warn_parts)
-                    )
-
-                log(
-                    f"{day.isoformat()} | sales={summary['sales']} | items={summary['items']} "
-                    f"| trans={summary['transactions']} | mock={summary['mock_bookings']} "
-                    f"| products={summary['products']} | special={summary['special_sales']} "
-                    f"| changes={summary['changes_detected']} | missing={summary['missing_marked']}"
-                )
-                day += timedelta(days=1)
+        warnings = []
+        if summary["missing_payments"]:
+            warnings.append(f"sales_sin_payment={summary['missing_payments']}")
+        if summary["payments_without_sale"]:
+            warnings.append(f"payments_sin_sale={summary['payments_without_sale']}")
+        if summary["memberships"]:
+            warnings.append(f"memberships={summary['memberships']}")
 
         metadata = {
-            "mode": "manual_multilocal_reconciliation",
+            "mode": "manual_multilocal_reconciliation_v4",
             "source": "github-actions",
             "locations": LOCATIONS,
-            "days_processed": totals["days_processed"],
-            "mock_bookings": totals["mock_bookings"],
-            "products": totals["products"],
-            "memberships_detected_not_loaded": totals["memberships"],
-            "giftcards_loaded_or_detected": totals["giftcards"],
-            "special_sales_resolved": totals["special_sales"],
-            "changes_detected": totals["changes_detected"],
-            "sales_marked_missing": totals["missing_marked"],
-            "missing_sales_resolved_by_detail": totals["missing_resolved"],
-            "warnings": totals["warnings"][:100],
+            "strategy": "single_window_all_locations",
+            "elapsed_seconds": elapsed,
+            "mock_bookings": summary["mock_bookings"],
+            "products": summary["products"],
+            "memberships_detected_not_loaded": summary["memberships"],
+            "giftcards_loaded_or_detected": summary["giftcards"],
+            "special_sales_resolved": summary["special_sales"],
+            "changes_detected": summary["changes_detected"],
+            "sales_marked_missing": summary["missing_marked"],
+            "missing_sales_resolved_by_detail": summary["missing_resolved"],
+            "new_sales": summary["new_sales"],
+            "item_sales_replaced": summary["changed_item_sales"],
+            "transaction_sales_replaced": summary["changed_transaction_sales"],
+            "warnings": warnings,
         }
 
         supabase_update(
@@ -1017,30 +1041,29 @@ def main():
             {
                 "finished_at": now_utc_iso(),
                 "status": "success",
-                "sales_read": totals["sales"],
-                "items_read": totals["items"],
-                "transactions_read": totals["transactions"],
-                "sales_upserted": totals["sales"],
-                "items_upserted": totals["items"],
-                "transactions_upserted": totals["transactions"],
+                "sales_read": summary["sales"],
+                "items_read": summary["items"],
+                "transactions_read": summary["transactions"],
+                "sales_upserted": summary["sales"],
+                "items_upserted": summary["changed_item_sales"],
+                "transactions_upserted": summary["changed_transaction_sales"],
                 "metadata": metadata,
             },
         )
 
         log("\n========================================")
-        log("SYNC MANUAL OK")
-        log(f"Ventas:        {totals['sales']}")
-        log(f"Items:         {totals['items']}")
-        log(f"Transacciones: {totals['transactions']}")
-        log(f"Mock bookings: {totals['mock_bookings']}")
-        log(f"Productos:     {totals['products']}")
-        log(f"Memberships detectados: {totals['memberships']}")
-        log(f"Giftcards cargadas/detectadas: {totals['giftcards']}")
-        log(f"Ventas especiales resueltas:  {totals['special_sales']}")
-        log(f"Cambios detectados: {totals['changes_detected']}")
-        log(f"Ventas marcadas ausentes: {totals['missing_marked']}")
-        log(f"Ausentes resueltas por detalle: {totals['missing_resolved']}")
-        log(f"Warnings:      {len(totals['warnings'])}")
+        log("SYNC OPTIMIZADO OK")
+        log(f"Ventas leidas:          {summary['sales']}")
+        log(f"Items leidos:           {summary['items']}")
+        log(f"Transacciones leidas:   {summary['transactions']}")
+        log(f"Ventas nuevas:          {summary['new_sales']}")
+        log(f"Ventas especiales:      {summary['special_sales']}")
+        log(f"Ventas con items cambiados: {summary['changed_item_sales']}")
+        log(f"Ventas con pagos cambiados: {summary['changed_transaction_sales']}")
+        log(f"Cambios detectados:     {summary['changes_detected']}")
+        log(f"Missing marcadas:       {summary['missing_marked']}")
+        log(f"Missing resueltas:      {summary['missing_resolved']}")
+        log(f"Tiempo total:           {elapsed} segundos")
         log("========================================")
 
     except Exception as exc:
@@ -1051,16 +1074,14 @@ def main():
                 {
                     "finished_at": now_utc_iso(),
                     "status": "error",
-                    "error_message": str(exc)[:3000],
                     "metadata": {
-                        "mode": "manual_multilocal_reconciliation",
-                        "source": "github-actions",
-                        "locations": LOCATIONS,
+                        "mode": "manual_multilocal_reconciliation_v4",
+                        "error": str(exc)[:3000],
                     },
                 },
             )
-        except Exception as log_exc:
-            log(f"No se pudo registrar error en agenda_sync_runs: {log_exc}")
+        except Exception:
+            pass
         raise
 
 

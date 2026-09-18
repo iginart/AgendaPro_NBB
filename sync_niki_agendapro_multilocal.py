@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -184,6 +184,13 @@ def supabase_insert_rows(table, rows, batch_size=250):
         supabase_insert(table, rows[pos:pos + batch_size], return_representation=False)
 
 
+def supabase_upsert_rows(table, rows, on_conflict, batch_size=250):
+    if not rows:
+        return
+    for pos in range(0, len(rows), batch_size):
+        supabase_upsert(table, rows[pos:pos + batch_size], on_conflict)
+
+
 def supabase_rows_by_sale_ids(table, sale_ids):
     ids = sorted({int(x) for x in sale_ids if x is not None})
     out = []
@@ -200,17 +207,10 @@ def normalize_number(value):
     if value in (None, ""):
         return None
     try:
-        # Supabase devuelve estos numeric con hasta 6 decimales. AgendaPro puede
-        # traer el mismo valor como float con mas precision binaria (por ejemplo,
-        # 9.999999999999998 en lugar de 10). Para comparar, llevamos ambos lados
-        # a la misma precision y evitamos falsos cambios.
-        d = Decimal(str(value)).quantize(
-            Decimal("0.000001"),
-            rounding=ROUND_HALF_UP,
-        )
+        d = Decimal(str(value))
         if d == 0:
             return "0"
-        return format(d, "f").rstrip("0").rstrip(".")
+        return format(d.normalize(), "f")
     except (InvalidOperation, ValueError, TypeError):
         return value
 
@@ -831,13 +831,53 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
     # PostgREST exige las mismas claves para todos los objetos del array.
     item_rows = [{key: row.get(key) for key in ITEM_KEYS} for row in item_rows]
 
-    # Deduplicacion defensiva por claves naturales.
+    # Deduplicacion defensiva por las mismas claves naturales que usa Supabase.
+    # agenda_sale_items tiene UNIQUE (item_type, source_item_id). Por eso sale_id
+    # NO puede formar parte de la identidad del item: AgendaPro puede reasociar
+    # un booking/item existente a otra venta.
     sale_rows = list({int(r["sale_id"]): r for r in sale_rows}.values())
     transaction_rows = list({int(r["transaction_id"]): r for r in transaction_rows}.values())
+
+    sale_by_id = {int(r["sale_id"]): r for r in sale_rows}
+
+    def item_priority(row):
+        sale = sale_by_id.get(int(row["sale_id"]), {})
+
+        # Ante una duplicacion entre ventas, preferimos una venta activa.
+        active_rank = 0 if is_cancelled_status(sale.get("status")) else 1
+
+        # Si ambas estan activas, preferimos la representacion mas reciente.
+        # Los timestamps ISO UTC se pueden ordenar lexicograficamente.
+        paid_at_rank = sale.get("paid_at_source") or ""
+
+        return (
+            active_rank,
+            paid_at_rank,
+            int(row["sale_id"]),
+        )
+
     item_unique = {}
     for r in item_rows:
-        key = (r.get("item_type"), r.get("source_item_id"), r.get("sale_id"))
-        item_unique[key] = r
+        key = (r.get("item_type"), r.get("source_item_id"))
+        previous = item_unique.get(key)
+
+        if previous is None:
+            item_unique[key] = r
+            continue
+
+        if int(previous["sale_id"]) != int(r["sale_id"]):
+            chosen = max((previous, r), key=item_priority)
+            log(
+                "Item AgendaPro reasociado/doble: "
+                f"tipo={key[0]} source_item_id={key[1]} "
+                f"sale_1={previous['sale_id']} sale_2={r['sale_id']} "
+                f"sale_elegida={chosen['sale_id']}"
+            )
+            item_unique[key] = chosen
+        else:
+            # Mismo item dentro de la misma venta: conservar la ultima version.
+            item_unique[key] = r
+
     item_rows = list(item_unique.values())
 
     incoming_ids = {int(r["sale_id"]) for r in sale_rows}
@@ -953,15 +993,26 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
         supabase_upsert("agenda_sales", sale_rows[pos:pos + 250], "sale_id")
 
     # Hijos solo se reemplazan cuando realmente cambiaron o la venta es nueva.
+    # Luego del DELETE usamos UPSERT. Esto permite que un item/transaccion que
+    # AgendaPro reasocio a otra sale_id actualice la fila existente en vez de
+    # fallar por una restriccion UNIQUE global.
     if changed_item_sale_ids:
         supabase_delete_by_sale_ids("agenda_sale_items", changed_item_sale_ids)
         changed_items = [r for r in item_rows if int(r["sale_id"]) in changed_item_sale_ids]
-        supabase_insert_rows("agenda_sale_items", changed_items)
+        supabase_upsert_rows(
+            "agenda_sale_items",
+            changed_items,
+            "item_type,source_item_id",
+        )
 
     if changed_tx_sale_ids:
         supabase_delete_by_sale_ids("agenda_payment_transactions", changed_tx_sale_ids)
         changed_tx = [r for r in transaction_rows if int(r["sale_id"]) in changed_tx_sale_ids]
-        supabase_insert_rows("agenda_payment_transactions", changed_tx)
+        supabase_upsert_rows(
+            "agenda_payment_transactions",
+            changed_tx,
+            "transaction_id",
+        )
 
     # Ventas activas que estaban dentro de la ventana pero ya no aparecen en la API actual.
     existing_active_ids = {
@@ -1002,10 +1053,22 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
             supabase_upsert("agenda_sales", [detail_sale], "sale_id")
 
             # El detalle puede traer items especiales; si los trae, reemplazarlos.
+            # Tambien aqui usamos UPSERT porque source_item_id es global y puede
+            # haber quedado previamente asociado a otra venta.
             detail_items = [{key: row.get(key) for key in ITEM_KEYS} for row in build_detail_items(detail)]
             if detail_items:
+                detail_unique = {}
+                for item in detail_items:
+                    detail_key = (item.get("item_type"), item.get("source_item_id"))
+                    detail_unique[detail_key] = item
+                detail_items = list(detail_unique.values())
+
                 supabase_delete_by_sale_ids("agenda_sale_items", [sid])
-                supabase_insert_rows("agenda_sale_items", detail_items)
+                supabase_upsert_rows(
+                    "agenda_sale_items",
+                    detail_items,
+                    "item_type,source_item_id",
+                )
 
             changes_detected += 1
             missing_resolved += 1
@@ -1090,7 +1153,7 @@ def main():
     try:
         cookie_header = login_agendapro()
         log("\n========================================")
-        log("SYNC AGENDA PRO -> NIKI OS V5.1")
+        log("SYNC AGENDA PRO -> NIKI OS V5")
         log(f"Modo: {mode_label}")
         log(f"Desde: {start_day}")
         log(f"Hasta: {end_day}")
@@ -1145,7 +1208,7 @@ def main():
         )
 
         log("\n========================================")
-        log("SYNC V5.1 OK")
+        log("SYNC V5 OK")
         log(f"Ventas leidas:          {summary['sales']}")
         log(f"Items leidos:           {summary['items']}")
         log(f"Transacciones leidas:   {summary['transactions']}")

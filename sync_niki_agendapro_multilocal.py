@@ -17,6 +17,10 @@ ARG_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 UTC = timezone.utc
 ROLLING_DAYS = 10
 SYNC_MODE = os.getenv("SYNC_MODE", "today").strip().lower()
+SYNC_FROM = os.getenv("SYNC_FROM", "").strip()
+SYNC_TO = os.getenv("SYNC_TO", "").strip()
+HISTORICAL_MAX_DAYS = int(os.getenv("HISTORICAL_MAX_DAYS", "31"))
+REFRESH_COMMISSION_SHADOW = os.getenv("REFRESH_COMMISSION_SHADOW", "true").strip().lower() not in {"0", "false", "no", "off"}
 PER_PAGE = 100
 HTTP = requests.Session()
 
@@ -159,6 +163,69 @@ def supabase_select(table, params=None):
     if r.status_code != 200:
         raise RuntimeError(f"Supabase SELECT {table}: HTTP {r.status_code} - {r.text[:2000]}")
     return r.json()
+
+
+def supabase_rpc(function_name, payload=None):
+    r = HTTP.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/{function_name}",
+        headers=supabase_headers("return=representation"),
+        json=payload or {},
+        timeout=180,
+    )
+    if r.status_code not in (200, 201, 204):
+        raise RuntimeError(
+            f"Supabase RPC {function_name}: HTTP {r.status_code} - {r.text[:3000]}"
+        )
+    if r.status_code == 204 or not r.text.strip():
+        return None
+    return r.json()
+
+
+def parse_sync_date(value, env_name):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{env_name} invalido: {value!r}. Usar formato YYYY-MM-DD."
+        ) from exc
+
+
+def resolve_sync_window(today_arg):
+    if SYNC_MODE == "today":
+        return today_arg, today_arg, "today"
+
+    if SYNC_MODE == "rolling":
+        start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
+        return start_day, today_arg, f"rolling_{ROLLING_DAYS}_days"
+
+    if SYNC_MODE in {"historical", "backfill"}:
+        if not SYNC_FROM or not SYNC_TO:
+            raise RuntimeError(
+                "Para SYNC_MODE=historical se requieren SYNC_FROM y SYNC_TO "
+                "en formato YYYY-MM-DD."
+            )
+
+        start_day = parse_sync_date(SYNC_FROM, "SYNC_FROM")
+        end_day = parse_sync_date(SYNC_TO, "SYNC_TO")
+
+        if end_day < start_day:
+            raise RuntimeError("SYNC_TO no puede ser anterior a SYNC_FROM.")
+
+        total_days = (end_day - start_day).days + 1
+        if total_days > HISTORICAL_MAX_DAYS:
+            raise RuntimeError(
+                f"El backfill historico admite hasta {HISTORICAL_MAX_DAYS} dias por ejecucion. "
+                f"Rango solicitado: {total_days} dias. Ejecutar por bloques mensuales."
+            )
+
+        if end_day > today_arg:
+            raise RuntimeError("SYNC_TO no puede ser posterior a la fecha actual.")
+
+        return start_day, end_day, f"historical_{start_day}_{end_day}"
+
+    raise RuntimeError(
+        f"SYNC_MODE invalido: {SYNC_MODE}. Valores permitidos: today, rolling, historical"
+    )
 
 
 def supabase_delete_by_sale_ids(table, sale_ids):
@@ -1119,19 +1186,7 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
 def main():
     started = time.time()
     today_arg = datetime.now(ARG_TZ).date()
-
-    if SYNC_MODE == "today":
-        start_day = today_arg
-        end_day = today_arg
-        mode_label = "today"
-    elif SYNC_MODE == "rolling":
-        start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
-        end_day = today_arg
-        mode_label = f"rolling_{ROLLING_DAYS}_days"
-    else:
-        raise RuntimeError(
-            f"SYNC_MODE invalido: {SYNC_MODE}. Valores permitidos: today, rolling"
-        )
+    start_day, end_day, mode_label = resolve_sync_window(today_arg)
 
     run = supabase_insert(
         "agenda_sync_runs",
@@ -1161,6 +1216,15 @@ def main():
         log("========================================\n")
 
         summary = run_window(cookie_header, start_day, end_day, sync_run_id)
+
+        shadow_refresh = None
+        if REFRESH_COMMISSION_SHADOW:
+            log("Refrescando comisiones_agendapro_shadow...")
+            shadow_refresh = supabase_rpc("refrescar_comisiones_agendapro_shadow")
+            log(f"Shadow actualizada: {shadow_refresh}")
+        else:
+            log("Refresh de shadow omitido por REFRESH_COMMISSION_SHADOW=false")
+
         elapsed = round(time.time() - started, 1)
 
         warnings = []
@@ -1188,6 +1252,10 @@ def main():
             "new_sales": summary["new_sales"],
             "item_sales_replaced": summary["changed_item_sales"],
             "transaction_sales_replaced": summary["changed_transaction_sales"],
+            "shadow_refreshed": REFRESH_COMMISSION_SHADOW,
+            "shadow_refresh_result": shadow_refresh,
+            "sync_from": start_day.isoformat(),
+            "sync_to": end_day.isoformat(),
             "warnings": warnings,
         }
 
@@ -1220,6 +1288,7 @@ def main():
         log(f"Missing marcadas:       {summary['missing_marked']}")
         log(f"Missing resueltas:      {summary['missing_resolved']}")
         log(f"Modo:                   {mode_label}")
+        log(f"Shadow refrescada:      {REFRESH_COMMISSION_SHADOW}")
         log(f"Tiempo total:           {elapsed} segundos")
         log("========================================")
 

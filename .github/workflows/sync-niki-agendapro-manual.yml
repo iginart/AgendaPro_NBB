@@ -11,6 +11,17 @@ on:
         options:
           - today
           - rolling
+          - historical
+
+      sync_from:
+        description: "Desde (YYYY-MM-DD) - solo para historical"
+        required: false
+        type: string
+
+      sync_to:
+        description: "Hasta (YYYY-MM-DD) - solo para historical"
+        required: false
+        type: string
 
   schedule:
     # Durante el día: cada hora de 08:15 a 23:15
@@ -20,6 +31,10 @@ on:
     # Reconciliación nocturna: últimos 10 días
     - cron: "30 3 * * *"
       timezone: "America/Argentina/Buenos_Aires"
+
+concurrency:
+  group: sync-niki-agendapro
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -42,11 +57,30 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Resolve sync mode
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             SYNC_MODE="${{ inputs.sync_mode }}"
+
+            if [ "$SYNC_MODE" = "historical" ]; then
+              SYNC_FROM="${{ inputs.sync_from }}"
+              SYNC_TO="${{ inputs.sync_to }}"
+
+              if [ -z "$SYNC_FROM" ] || [ -z "$SYNC_TO" ]; then
+                echo "Para historical tenés que completar Desde y Hasta."
+                exit 1
+              fi
+
+              echo "SYNC_FROM=$SYNC_FROM" >> "$GITHUB_ENV"
+              echo "SYNC_TO=$SYNC_TO" >> "$GITHUB_ENV"
+              echo "Rango histórico: $SYNC_FROM -> $SYNC_TO"
+            fi
+
           elif [ "${{ github.event.schedule }}" = "30 3 * * *" ]; then
             SYNC_MODE="rolling"
+
           else
             SYNC_MODE="today"
           fi

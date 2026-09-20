@@ -181,6 +181,33 @@ def supabase_rpc(function_name, payload=None):
     return r.json()
 
 
+
+
+def refresh_dashboard_materialized_best_effort():
+    """
+    Refresca la base materializada del Dashboard una sola vez al final de
+    today/rolling. En historical/backfill se omite para no recalcular en cada bloque.
+    Un timeout no invalida la sincronizacion fuente.
+    """
+    if SYNC_MODE in {"historical", "backfill"}:
+        log("Modo historico/backfill: se omite refresh de mv_agendapro_kpi_local_dia.")
+        return {"attempted": False, "ok": None, "result": None, "error": None}
+
+    log("Refrescando materializados del Dashboard...")
+    try:
+        result = supabase_rpc("refrescar_agendapro_kpi_materializados")
+        log(f"Dashboard materializado actualizado: {result}")
+        return {"attempted": True, "ok": True, "result": result, "error": None}
+    except Exception as exc:
+        message = str(exc)
+        log(
+            "WARNING: no se pudo refrescar el Dashboard materializado. "
+            "La sincronizacion fuente continua como exitosa. "
+            f"Detalle: {message[:1200]}"
+        )
+        return {"attempted": True, "ok": False, "result": None, "error": message[:3000]}
+
+
 def parse_sync_date(value, env_name):
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -1398,6 +1425,8 @@ def main():
                 sync_run_id,
             )
 
+        dashboard_refresh_state = refresh_dashboard_materialized_best_effort()
+
         shadow_state = refresh_commission_shadow_best_effort()
         shadow_refresh = shadow_state["result"]
 
@@ -1428,6 +1457,10 @@ def main():
             "new_sales": summary["new_sales"],
             "item_sales_replaced": summary["changed_item_sales"],
             "transaction_sales_replaced": summary["changed_transaction_sales"],
+            "dashboard_refresh_attempted": dashboard_refresh_state["attempted"],
+            "dashboard_refreshed": dashboard_refresh_state["ok"] is True,
+            "dashboard_refresh_result": dashboard_refresh_state["result"],
+            "dashboard_refresh_error": dashboard_refresh_state["error"],
             "shadow_refresh_attempted": shadow_state["attempted"],
             "shadow_refreshed": shadow_state["ok"] is True,
             "shadow_refresh_result": shadow_refresh,
@@ -1471,6 +1504,16 @@ def main():
         if SYNC_MODE == "rolling":
             log(f"Rolling dia por dia:     SI")
             log(f"Ventas purgadas:         {purged_sales}")
+        log(
+            "Dashboard refrescado:   "
+            + (
+                "SI"
+                if dashboard_refresh_state["ok"] is True
+                else "NO (omitido)"
+                if dashboard_refresh_state["attempted"] is False
+                else "NO (fallo no bloqueante)"
+            )
+        )
         log(
             "Shadow refrescada:      "
             + (

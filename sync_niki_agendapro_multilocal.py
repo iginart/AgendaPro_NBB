@@ -301,6 +301,125 @@ def supabase_rows_by_sale_ids(table, sale_ids):
     return out
 
 
+def supabase_select_all(table, params=None, page_size=1000):
+    """
+    Lee todas las filas de una consulta PostgREST usando Range.
+    Evita el limite habitual de 1000 filas.
+    """
+    out = []
+    offset = 0
+
+    while True:
+        q = {"select": "*"}
+        if params:
+            q.update(params)
+
+        headers = supabase_headers()
+        headers["Range"] = f"{offset}-{offset + page_size - 1}"
+
+        r = HTTP.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=headers,
+            params=q,
+            timeout=120,
+        )
+
+        if r.status_code not in (200, 206):
+            raise RuntimeError(
+                f"Supabase SELECT ALL {table}: HTTP {r.status_code} - {r.text[:2000]}"
+            )
+
+        rows = r.json()
+        out.extend(rows)
+
+        if len(rows) < page_size:
+            break
+
+        offset += page_size
+
+    return out
+
+
+def purge_sales_window(start_day, end_day):
+    """
+    Borra del staging AgendaPro todas las ventas del rango y de los locales
+    sincronizados, junto con sus items y transacciones.
+
+    Se usa antes de un rolling completo para garantizar que los 10 dias
+    se reconstruyan desde cero.
+    """
+    locations_csv = ",".join(str(x) for x in LOCATIONS)
+
+    log(
+        f"Purgando datos existentes desde {start_day} hasta {end_day} "
+        f"para {len(LOCATIONS)} locales..."
+    )
+
+    rows = supabase_select_all(
+        "agenda_sales",
+        {
+            "select": "sale_id",
+            "location_id": f"in.({locations_csv})",
+            "and": (
+                f"(business_date.gte.{start_day.isoformat()},"
+                f"business_date.lte.{end_day.isoformat()})"
+            ),
+            "order": "sale_id.asc",
+        },
+    )
+
+    sale_ids = sorted(
+        {
+            int(r["sale_id"])
+            for r in rows
+            if r.get("sale_id") is not None
+        }
+    )
+
+    if not sale_ids:
+        log("Purga: no habia ventas existentes en el rango.")
+        return 0
+
+    log(f"Purga: {len(sale_ids)} ventas a eliminar.")
+
+    supabase_delete_by_sale_ids("agenda_sale_items", sale_ids)
+    supabase_delete_by_sale_ids("agenda_payment_transactions", sale_ids)
+    supabase_delete_by_sale_ids("agenda_sales", sale_ids)
+
+    log(f"Purga finalizada: {len(sale_ids)} ventas eliminadas.")
+    return len(sale_ids)
+
+
+def empty_summary():
+    return {
+        "payments": 0,
+        "sales": 0,
+        "regular_sales": 0,
+        "special_sales": 0,
+        "transactions": 0,
+        "items": 0,
+        "missing_payments": 0,
+        "payments_without_sale": 0,
+        "orphan_transactions": 0,
+        "memberships": 0,
+        "giftcards": 0,
+        "mock_bookings": 0,
+        "products": 0,
+        "changes_detected": 0,
+        "missing_marked": 0,
+        "missing_resolved": 0,
+        "changed_item_sales": 0,
+        "changed_transaction_sales": 0,
+        "new_sales": 0,
+    }
+
+
+def add_summary(total, part):
+    for key in total:
+        total[key] += int(part.get(key) or 0)
+    return total
+
+
 def normalize_number(value):
     if value in (None, ""):
         return None
@@ -1246,7 +1365,38 @@ def main():
         log(f"Locales: {len(LOCATIONS)} (en una sola ventana)")
         log("========================================\n")
 
-        summary = run_window(cookie_header, start_day, end_day, sync_run_id)
+        if SYNC_MODE == "rolling":
+            purged_sales = purge_sales_window(start_day, end_day)
+
+            summary = empty_summary()
+            current_day = start_day
+
+            while current_day <= end_day:
+                log("\n----------------------------------------")
+                log(f"ROLLING DIA: {current_day}")
+                log("----------------------------------------")
+
+                day_summary = run_window(
+                    cookie_header,
+                    current_day,
+                    current_day,
+                    sync_run_id,
+                )
+                add_summary(summary, day_summary)
+                current_day += timedelta(days=1)
+
+            log(
+                f"Rolling reconstruido dia por dia. "
+                f"Ventas eliminadas previamente: {purged_sales}"
+            )
+        else:
+            purged_sales = 0
+            summary = run_window(
+                cookie_header,
+                start_day,
+                end_day,
+                sync_run_id,
+            )
 
         shadow_state = refresh_commission_shadow_best_effort()
         shadow_refresh = shadow_state["result"]
@@ -1284,6 +1434,8 @@ def main():
             "shadow_refresh_error": shadow_state["error"],
             "sync_from": start_day.isoformat(),
             "sync_to": end_day.isoformat(),
+            "rolling_day_by_day": SYNC_MODE == "rolling",
+            "rolling_purged_sales": purged_sales,
             "warnings": warnings,
         }
 
@@ -1316,6 +1468,9 @@ def main():
         log(f"Missing marcadas:       {summary['missing_marked']}")
         log(f"Missing resueltas:      {summary['missing_resolved']}")
         log(f"Modo:                   {mode_label}")
+        if SYNC_MODE == "rolling":
+            log(f"Rolling dia por dia:     SI")
+            log(f"Ventas purgadas:         {purged_sales}")
         log(
             "Shadow refrescada:      "
             + (

@@ -228,6 +228,37 @@ def resolve_sync_window(today_arg):
     )
 
 
+def should_refresh_derived():
+    """Los historical/backfill cargan fuente; los derivados se refrescan al final."""
+    if SYNC_MODE in {"historical", "backfill"}:
+        return False
+    return REFRESH_COMMISSION_SHADOW
+
+
+def refresh_commission_shadow_best_effort():
+    """El refresh derivado no debe hacer fallar una sync fuente ya guardada."""
+    if not should_refresh_derived():
+        if SYNC_MODE in {"historical", "backfill"}:
+            log("Modo historico/backfill: se omite refresh de comisiones_agendapro_shadow.")
+        else:
+            log("Refresh de shadow omitido por REFRESH_COMMISSION_SHADOW=false")
+        return {"attempted": False, "ok": None, "result": None, "error": None}
+
+    log("Refrescando comisiones_agendapro_shadow...")
+    try:
+        result = supabase_rpc("refrescar_comisiones_agendapro_shadow")
+        log(f"Shadow actualizada: {result}")
+        return {"attempted": True, "ok": True, "result": result, "error": None}
+    except Exception as exc:
+        message = str(exc)
+        log(
+            "WARNING: no se pudo refrescar comisiones_agendapro_shadow. "
+            "La sincronizacion fuente continua como exitosa. "
+            f"Detalle: {message[:1200]}"
+        )
+        return {"attempted": True, "ok": False, "result": None, "error": message[:3000]}
+
+
 def supabase_delete_by_sale_ids(table, sale_ids):
     ids = sorted({int(x) for x in sale_ids if x is not None})
     if not ids:
@@ -1217,13 +1248,8 @@ def main():
 
         summary = run_window(cookie_header, start_day, end_day, sync_run_id)
 
-        shadow_refresh = None
-        if REFRESH_COMMISSION_SHADOW:
-            log("Refrescando comisiones_agendapro_shadow...")
-            shadow_refresh = supabase_rpc("refrescar_comisiones_agendapro_shadow")
-            log(f"Shadow actualizada: {shadow_refresh}")
-        else:
-            log("Refresh de shadow omitido por REFRESH_COMMISSION_SHADOW=false")
+        shadow_state = refresh_commission_shadow_best_effort()
+        shadow_refresh = shadow_state["result"]
 
         elapsed = round(time.time() - started, 1)
 
@@ -1252,8 +1278,10 @@ def main():
             "new_sales": summary["new_sales"],
             "item_sales_replaced": summary["changed_item_sales"],
             "transaction_sales_replaced": summary["changed_transaction_sales"],
-            "shadow_refreshed": REFRESH_COMMISSION_SHADOW,
+            "shadow_refresh_attempted": shadow_state["attempted"],
+            "shadow_refreshed": shadow_state["ok"] is True,
             "shadow_refresh_result": shadow_refresh,
+            "shadow_refresh_error": shadow_state["error"],
             "sync_from": start_day.isoformat(),
             "sync_to": end_day.isoformat(),
             "warnings": warnings,
@@ -1288,7 +1316,16 @@ def main():
         log(f"Missing marcadas:       {summary['missing_marked']}")
         log(f"Missing resueltas:      {summary['missing_resolved']}")
         log(f"Modo:                   {mode_label}")
-        log(f"Shadow refrescada:      {REFRESH_COMMISSION_SHADOW}")
+        log(
+            "Shadow refrescada:      "
+            + (
+                "SI"
+                if shadow_state["ok"] is True
+                else "NO (omitida)"
+                if shadow_state["attempted"] is False
+                else "NO (fallo no bloqueante)"
+            )
+        )
         log(f"Tiempo total:           {elapsed} segundos")
         log("========================================")
 

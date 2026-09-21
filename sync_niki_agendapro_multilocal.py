@@ -138,16 +138,60 @@ def supabase_upsert(table, rows, on_conflict):
         raise RuntimeError(f"Supabase UPSERT {table}: HTTP {r.status_code} - {r.text[:3000]}")
 
 
-def supabase_update(table, filters, values):
+def supabase_update(table, filters, values, retries=5):
     qs = "&".join(f"{k}=eq.{v}" for k, v in filters.items())
-    r = HTTP.patch(
-        f"{SUPABASE_URL}/rest/v1/{table}?{qs}",
-        headers=supabase_headers("return=minimal"),
-        json=values,
-        timeout=90,
-    )
-    if r.status_code not in (200, 204):
-        raise RuntimeError(f"Supabase UPDATE {table}: HTTP {r.status_code} - {r.text[:2000]}")
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = HTTP.patch(
+                f"{SUPABASE_URL}/rest/v1/{table}?{qs}",
+                headers=supabase_headers("return=minimal"),
+                json=values,
+                timeout=90,
+            )
+
+            if r.status_code in (200, 204):
+                return
+
+            body = r.text[:2000]
+            transient = (
+                r.status_code in (502, 503, 504)
+                or "PGRST002" in body
+                or "schema cache" in body.lower()
+            )
+
+            if transient and attempt < retries:
+                wait_seconds = min(2 ** attempt, 15)
+                log(
+                    f"WARNING: Supabase UPDATE {table} fallo transitorio "
+                    f"(intento {attempt}/{retries}). "
+                    f"Reintentando en {wait_seconds}s..."
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            raise RuntimeError(
+                f"Supabase UPDATE {table}: HTTP {r.status_code} - {body}"
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < retries:
+                wait_seconds = min(2 ** attempt, 15)
+                log(
+                    f"WARNING: Supabase UPDATE {table} fallo "
+                    f"(intento {attempt}/{retries}). "
+                    f"Reintentando en {wait_seconds}s... Detalle: {exc}"
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            raise
+
+    if last_error:
+        raise last_error
 
 
 def supabase_select(table, params=None):
@@ -1472,21 +1516,28 @@ def main():
             "warnings": warnings,
         }
 
-        supabase_update(
-            "agenda_sync_runs",
-            {"id": sync_run_id},
-            {
-                "finished_at": now_utc_iso(),
-                "status": "success",
-                "sales_read": summary["sales"],
-                "items_read": summary["items"],
-                "transactions_read": summary["transactions"],
-                "sales_upserted": summary["sales"],
-                "items_upserted": summary["changed_item_sales"],
-                "transactions_upserted": summary["changed_transaction_sales"],
-                "metadata": metadata,
-            },
-        )
+        try:
+            supabase_update(
+                "agenda_sync_runs",
+                {"id": sync_run_id},
+                {
+                    "finished_at": now_utc_iso(),
+                    "status": "success",
+                    "sales_read": summary["sales"],
+                    "items_read": summary["items"],
+                    "transactions_read": summary["transactions"],
+                    "sales_upserted": summary["sales"],
+                    "items_upserted": summary["changed_item_sales"],
+                    "transactions_upserted": summary["changed_transaction_sales"],
+                    "metadata": metadata,
+                },
+            )
+        except Exception as exc:
+            log(
+                "WARNING: la sincronizacion termino correctamente, pero no se pudo "
+                "actualizar agenda_sync_runs. La carga fuente queda como exitosa. "
+                f"Detalle: {exc}"
+            )
 
         log("\n========================================")
         log("SYNC V5 OK")

@@ -209,12 +209,12 @@ def supabase_select(table, params=None):
     return r.json()
 
 
-def supabase_rpc(function_name, payload=None):
+def supabase_rpc(function_name, payload=None, timeout=180):
     r = HTTP.post(
         f"{SUPABASE_URL}/rest/v1/rpc/{function_name}",
         headers=supabase_headers("return=representation"),
         json=payload or {},
-        timeout=180,
+        timeout=timeout,
     )
     if r.status_code not in (200, 201, 204):
         raise RuntimeError(
@@ -304,6 +304,31 @@ def should_refresh_derived():
     if SYNC_MODE in {"historical", "backfill"}:
         return False
     return REFRESH_COMMISSION_SHADOW
+
+
+def refresh_operational_caches_best_effort():
+    """
+    Refresca caches pesadas de Clientes y pendientes de comisiones fuera del camino
+    interactivo. Se ejecuta una sola vez al final de today/rolling.
+    Si falla, la sincronizacion fuente sigue siendo exitosa.
+    """
+    if SYNC_MODE in {"historical", "backfill"}:
+        log("Modo historico/backfill: se omite refresh de caches operativos.")
+        return {"attempted": False, "ok": None, "result": None, "error": None}
+
+    log("Refrescando caches de Clientes y comisiones no vinculadas...")
+    try:
+        result = supabase_rpc("refrescar_niki_caches_operativos", timeout=600)
+        log(f"Caches operativos actualizados: {result}")
+        return {"attempted": True, "ok": True, "result": result, "error": None}
+    except Exception as exc:
+        message = str(exc)
+        log(
+            "WARNING: no se pudieron refrescar los caches operativos. "
+            "La sincronizacion fuente continua como exitosa. "
+            f"Detalle: {message[:1200]}"
+        )
+        return {"attempted": True, "ok": False, "result": None, "error": message[:3000]}
 
 
 def refresh_commission_shadow_best_effort():
@@ -1471,6 +1496,8 @@ def main():
 
         dashboard_refresh_state = refresh_dashboard_materialized_best_effort()
 
+        operational_cache_state = refresh_operational_caches_best_effort()
+
         shadow_state = refresh_commission_shadow_best_effort()
         shadow_refresh = shadow_state["result"]
 
@@ -1505,6 +1532,10 @@ def main():
             "dashboard_refreshed": dashboard_refresh_state["ok"] is True,
             "dashboard_refresh_result": dashboard_refresh_state["result"],
             "dashboard_refresh_error": dashboard_refresh_state["error"],
+            "operational_cache_refresh_attempted": operational_cache_state["attempted"],
+            "operational_cache_refreshed": operational_cache_state["ok"] is True,
+            "operational_cache_refresh_result": operational_cache_state["result"],
+            "operational_cache_refresh_error": operational_cache_state["error"],
             "shadow_refresh_attempted": shadow_state["attempted"],
             "shadow_refreshed": shadow_state["ok"] is True,
             "shadow_refresh_result": shadow_refresh,
@@ -1562,6 +1593,16 @@ def main():
                 if dashboard_refresh_state["ok"] is True
                 else "NO (omitido)"
                 if dashboard_refresh_state["attempted"] is False
+                else "NO (fallo no bloqueante)"
+            )
+        )
+        log(
+            "Caches operativos:      "
+            + (
+                "SI"
+                if operational_cache_state["ok"] is True
+                else "NO (omitidos)"
+                if operational_cache_state["attempted"] is False
                 else "NO (fallo no bloqueante)"
             )
         )

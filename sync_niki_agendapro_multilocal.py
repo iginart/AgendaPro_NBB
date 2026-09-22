@@ -331,28 +331,69 @@ def refresh_operational_caches_best_effort():
         return {"attempted": True, "ok": False, "result": None, "error": message[:3000]}
 
 
-def refresh_commission_shadow_best_effort():
-    """El refresh derivado no debe hacer fallar una sync fuente ya guardada."""
+def refresh_commission_shadow_best_effort(start_day, end_day):
+    """
+    Refresca solamente el rango sincronizado del shadow de comisiones.
+
+    - today: solamente hoy.
+    - rolling: solamente los ultimos ROLLING_DAYS dias.
+    - historical/backfill: se mantiene omitido por seguridad operativa.
+
+    El refresh derivado no debe hacer fallar una sync fuente ya guardada.
+    """
     if not should_refresh_derived():
         if SYNC_MODE in {"historical", "backfill"}:
             log("Modo historico/backfill: se omite refresh de comisiones_agendapro_shadow.")
         else:
             log("Refresh de shadow omitido por REFRESH_COMMISSION_SHADOW=false")
-        return {"attempted": False, "ok": None, "result": None, "error": None}
+        return {
+            "attempted": False,
+            "ok": None,
+            "result": None,
+            "error": None,
+            "from": start_day.isoformat(),
+            "to": end_day.isoformat(),
+        }
 
-    log("Refrescando comisiones_agendapro_shadow...")
+    desde = start_day.isoformat()
+    hasta = end_day.isoformat()
+    log(f"Refrescando comisiones_agendapro_shadow: {desde} -> {hasta}...")
+
     try:
-        result = supabase_rpc("refrescar_comisiones_agendapro_shadow")
-        log(f"Shadow actualizada: {result}")
-        return {"attempted": True, "ok": True, "result": result, "error": None}
+        result = supabase_rpc(
+            "refrescar_comisiones_agendapro_shadow_rango",
+            {
+                "p_desde": desde,
+                "p_hasta": hasta,
+            },
+            timeout=180,
+        )
+        log(f"Shadow actualizada: SI ({desde} -> {hasta})")
+        log(f"Resultado shadow: {result}")
+        return {
+            "attempted": True,
+            "ok": True,
+            "result": result,
+            "error": None,
+            "from": desde,
+            "to": hasta,
+        }
     except Exception as exc:
         message = str(exc)
         log(
-            "WARNING: no se pudo refrescar comisiones_agendapro_shadow. "
+            "WARNING: no se pudo refrescar comisiones_agendapro_shadow por rango. "
             "La sincronizacion fuente continua como exitosa. "
+            f"Rango: {desde} -> {hasta}. "
             f"Detalle: {message[:1200]}"
         )
-        return {"attempted": True, "ok": False, "result": None, "error": message[:3000]}
+        return {
+            "attempted": True,
+            "ok": False,
+            "result": None,
+            "error": message[:3000],
+            "from": desde,
+            "to": hasta,
+        }
 
 
 def supabase_delete_by_sale_ids(table, sale_ids):
@@ -1498,7 +1539,7 @@ def main():
 
         operational_cache_state = refresh_operational_caches_best_effort()
 
-        shadow_state = refresh_commission_shadow_best_effort()
+        shadow_state = refresh_commission_shadow_best_effort(start_day, end_day)
         shadow_refresh = shadow_state["result"]
 
         elapsed = round(time.time() - started, 1)
@@ -1540,6 +1581,8 @@ def main():
             "shadow_refreshed": shadow_state["ok"] is True,
             "shadow_refresh_result": shadow_refresh,
             "shadow_refresh_error": shadow_state["error"],
+            "shadow_from": shadow_state.get("from"),
+            "shadow_to": shadow_state.get("to"),
             "sync_from": start_day.isoformat(),
             "sync_to": end_day.isoformat(),
             "rolling_day_by_day": SYNC_MODE == "rolling",
@@ -1616,6 +1659,8 @@ def main():
                 else "NO (fallo no bloqueante)"
             )
         )
+        if shadow_state.get("from") and shadow_state.get("to"):
+            log(f"Rango shadow:           {shadow_state['from']} -> {shadow_state['to']}")
         log(f"Tiempo total:           {elapsed} segundos")
         log("========================================")
 

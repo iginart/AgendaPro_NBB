@@ -94,5 +94,16 @@ jobs:
           AGENDAPRO_PASSWORD: ${{ secrets.AGENDAPRO_PASS }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SYNC_EXPENSES: "true"
+          EXPENSE_ROLLING_DAYS: "45"
         run: |
           python sync_niki_agendapro_multilocal.py
+
+      - name: Guardar diagnóstico de horarios de AgendaPro
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agendapro-horarios-diagnostico
+          path: agendapro_booking_schema.json
+          if-no-files-found: ignore
+          retention-days: 7

@@ -270,10 +270,10 @@ def resolve_sync_window(today_arg):
         start_day = today_arg - timedelta(days=ROLLING_DAYS - 1)
         return start_day, today_arg, f"rolling_{ROLLING_DAYS}_days"
 
-    if SYNC_MODE in {"historical", "backfill"}:
+    if SYNC_MODE in {"historical", "backfill", "expenses_only"}:
         if not SYNC_FROM or not SYNC_TO:
             raise RuntimeError(
-                "Para SYNC_MODE=historical se requieren SYNC_FROM y SYNC_TO "
+                f"Para SYNC_MODE={SYNC_MODE} se requieren SYNC_FROM y SYNC_TO "
                 "en formato YYYY-MM-DD."
             )
 
@@ -284,7 +284,7 @@ def resolve_sync_window(today_arg):
             raise RuntimeError("SYNC_TO no puede ser anterior a SYNC_FROM.")
 
         total_days = (end_day - start_day).days + 1
-        if total_days > HISTORICAL_MAX_DAYS:
+        if SYNC_MODE != "expenses_only" and total_days > HISTORICAL_MAX_DAYS:
             raise RuntimeError(
                 f"El backfill historico admite hasta {HISTORICAL_MAX_DAYS} dias por ejecucion. "
                 f"Rango solicitado: {total_days} dias. Ejecutar por bloques mensuales."
@@ -293,10 +293,11 @@ def resolve_sync_window(today_arg):
         if end_day > today_arg:
             raise RuntimeError("SYNC_TO no puede ser posterior a la fecha actual.")
 
-        return start_day, end_day, f"historical_{start_day}_{end_day}"
+        label = "expenses_only" if SYNC_MODE == "expenses_only" else "historical"
+        return start_day, end_day, f"{label}_{start_day}_{end_day}"
 
     raise RuntimeError(
-        f"SYNC_MODE invalido: {SYNC_MODE}. Valores permitidos: today, rolling, historical"
+        f"SYNC_MODE invalido: {SYNC_MODE}. Valores permitidos: today, rolling, historical, expenses_only"
     )
 
 
@@ -1596,7 +1597,7 @@ def fetch_agendapro_expenses(cookie_header, start_day, end_day):
 
 
 def sync_agendapro_expenses(cookie_header, start_day, end_day, sync_run_id):
-    if os.getenv("SYNC_EXPENSES", "true").lower() in {"false", "0", "no", "off"}:
+    if SYNC_MODE != "expenses_only" and os.getenv("SYNC_EXPENSES", "true").lower() in {"false", "0", "no", "off"}:
         return {"enabled": False}
     if SYNC_MODE == "rolling":
         days = int(os.getenv("EXPENSE_ROLLING_DAYS", "45"))
@@ -1673,10 +1674,46 @@ def capture_booking_time_schema(payments):
     path.write_text(json.dumps(samples, ensure_ascii=False, indent=2))
 
 
+def run_agendapro_expenses_only(start_day, end_day):
+    """Carga rangos históricos de gastos sin entrar al circuito de ventas."""
+    started = time.time()
+    cookie_header = login_agendapro()
+    current_day = start_day
+    total_rows = 0
+    total_pages = 0
+    completed = 0
+    log(f"SOLO GASTOS: {start_day} a {end_day}; {len(LOCATIONS)} locales")
+    while current_day <= end_day:
+        window_end = min(current_day + timedelta(days=30), end_day)
+        log(f"Gastos: bloque {current_day} a {window_end}")
+        try:
+            state = sync_agendapro_expenses(cookie_header, current_day, window_end, None)
+        except Exception:
+            log(f"ERROR en gastos: {current_day} a {window_end}. "
+                f"Bloques anteriores completados: {completed}. "
+                f"Para continuar, ejecutar expenses_only desde {current_day} hasta {end_day}.")
+            raise
+        total_rows += state["rows"]
+        total_pages += state["pages"]
+        completed += 1
+        log(f"Bloque de gastos confirmado: {current_day} a {window_end}")
+        if window_end == end_day:
+            break
+        current_day = window_end + timedelta(days=1)
+    summary = {"mode": "expenses_only", "from": start_day.isoformat(), "to": end_day.isoformat(),
+               "windows": completed, "rows": total_rows, "pages": total_pages,
+               "elapsed_seconds": round(time.time() - started, 1)}
+    log("SOLO GASTOS FINALIZADO: " + json.dumps(summary))
+    return summary
+
+
 def main():
     started = time.time()
     today_arg = datetime.now(ARG_TZ).date()
     start_day, end_day, mode_label = resolve_sync_window(today_arg)
+
+    if SYNC_MODE == "expenses_only":
+        return run_agendapro_expenses_only(start_day, end_day)
 
     run = supabase_insert(
         "agenda_sync_runs",

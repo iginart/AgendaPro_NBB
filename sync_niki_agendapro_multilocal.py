@@ -1129,6 +1129,7 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
     sample_counts = {"sale": 0, "items": 0, "transactions": 0}
     log("Leyendo AgendaPro en bloque para todos los locales...")
     payments = fetch_v1_payments_window(cookie_header, start_day, end_day)
+    capture_booking_time_schema(payments)
     sales = fetch_v2_sales_window(cookie_header, start_day, end_day)
     transactions = fetch_v2_transactions_window(cookie_header, start_day, end_day)
 
@@ -1471,6 +1472,207 @@ def run_window(cookie_header, start_day, end_day, sync_run_id):
     }
 
 
+
+def expense_decimal(value):
+    from decimal import ROUND_HALF_UP
+    if value is None or isinstance(value, bool):
+        raise ValueError("Un gasto no tiene importe válido")
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError("Importe de gasto inválido") from exc
+    if not amount.is_finite() or abs(amount) >= Decimal("10000000000000000"):
+        raise ValueError("Importe de gasto fuera de rango")
+    return str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def expense_day(value):
+    # AgendaPro entrega el día de caja: conservarlo, sin usar fecha de cobro.
+    if not isinstance(value, str):
+        raise ValueError("Un gasto no tiene fecha de caja válida")
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return datetime.strptime(value[:10], "%d-%m-%Y").date()
+
+
+def expense_integer(value, required=False):
+    if value is None or value == "":
+        if required:
+            raise ValueError("Un gasto no tiene identificador")
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Identificador de gasto inválido")
+    number = Decimal(str(value))
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError("Identificador de gasto inválido")
+    result = int(number)
+    if result == 0 and not required:
+        return None
+    if result <= 0 or result > 9223372036854775807:
+        raise ValueError("Identificador de gasto fuera de rango")
+    return result
+
+
+def fetch_agendapro_expenses(cookie_header, start_day, end_day):
+    from urllib.parse import urlencode
+    all_rows = {}
+    source_names = {}
+    page = 1
+    total_pages = None
+    while True:
+        query = urlencode({
+            "sales_cash": "true",
+            "from": start_day.strftime("%d-%m-%Y"),
+            "to": end_day.strftime("%d-%m-%Y"),
+            "ids": ",".join(str(x) for x in LOCATIONS),
+            "page": page,
+        })
+        payload = agenda_get(
+            "https://agendapro.com/api/views/admin/v1/payments/sales_cash_content_expenses?" + query,
+            cookie_header,
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("sales_cash_expenses"), list):
+            raise RuntimeError("AgendaPro gastos: respuesta incompleta; no se conciliaron datos")
+        raw_pages = payload.get("page_number")
+        # En este endpoint page_number es el total usado por el conector Qlik.
+        # Si cambia el contrato, abortar antes de modificar la instantánea.
+        try:
+            pages = int(raw_pages)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("AgendaPro gastos: falta page_number válido") from exc
+        if str(raw_pages) != str(pages) or not 0 <= pages <= 1000:
+            raise RuntimeError("AgendaPro gastos: paginación inválida")
+        pages = max(1, pages)
+        if total_pages is not None and pages != total_pages:
+            raise RuntimeError("AgendaPro gastos: cambió la paginación durante la lectura; reintentar")
+        total_pages = pages
+        for location in payload.get("locations") or []:
+            if isinstance(location, dict):
+                location_id = expense_integer(location.get("id"), required=True)
+                if location_id in LOCATIONS:
+                    source_names[location_id] = str(location.get("name") or "")
+        for raw in payload["sales_cash_expenses"]:
+            if not isinstance(raw, dict):
+                raise RuntimeError("AgendaPro gastos: fila inválida")
+            expense_id = expense_integer(raw.get("id"), required=True)
+            location_id = expense_integer(raw.get("location_id"), required=True)
+            day = expense_day(raw.get("date"))
+            if location_id not in LOCATIONS or not start_day <= day <= end_day:
+                raise RuntimeError("AgendaPro gastos: fila fuera del alcance solicitado; no se conciliaron datos")
+            code = str(raw.get("number") if raw.get("number") is not None else "").strip()
+            # Los códigos son texto: no inventar una categoría para valores vacíos.
+            if code.endswith(".0") and code[:-2].isdigit():
+                code = code[:-2]
+            if code.isdigit():
+                code = str(int(code))
+            row = {
+                "expense_id": expense_id,
+                "location_id": location_id,
+                "business_date": day.isoformat(),
+                "sales_cash_id": expense_integer(raw.get("sales_cash_id")),
+                "code": code or None,
+                "amount": expense_decimal(raw.get("amount")),
+                "notes": str(raw.get("notes") or ""),
+                "location_name": str(raw.get("location_name") or ""),
+                "payment_method_name": str(raw.get("payment_method_name") or ""),
+                "user_id": expense_integer(raw.get("user_id")),
+                "employee_code_id": expense_integer(raw.get("employee_code_id")),
+                "payment_method_id": expense_integer(raw.get("payment_method_id")),
+                "payment_method_type_id": expense_integer(raw.get("payment_method_type_id")),
+                "bank_id": expense_integer(raw.get("bank_id")),
+                "company_payment_method_id": expense_integer(raw.get("company_payment_method_id")),
+            }
+            if expense_id in all_rows and all_rows[expense_id] != row:
+                raise RuntimeError("AgendaPro gastos: identificador repetido con datos diferentes")
+            all_rows[expense_id] = row
+        if page >= total_pages:
+            break
+        page += 1
+    for row in all_rows.values():
+        if row["location_name"]:
+            source_names[row["location_id"]] = row["location_name"]
+    return list(all_rows.values()), total_pages, [{"location_id":i,"name":source_names.get(i,"")} for i in LOCATIONS]
+
+
+def sync_agendapro_expenses(cookie_header, start_day, end_day, sync_run_id):
+    if os.getenv("SYNC_EXPENSES", "true").lower() in {"false", "0", "no", "off"}:
+        return {"enabled": False}
+    if SYNC_MODE == "rolling":
+        days = int(os.getenv("EXPENSE_ROLLING_DAYS", "45"))
+        if not 1 <= days <= 62:
+            raise ValueError("EXPENSE_ROLLING_DAYS debe estar entre 1 y 62")
+        start_day = end_day - timedelta(days=days - 1)
+    rows, pages, locations = fetch_agendapro_expenses(cookie_header, start_day, end_day)
+    # Una transacción SQL aplica todas las páginas, incluso un rango vacío.
+    # Nunca usar min/max de las filas: quedarían gastos eliminados en los bordes.
+    result = supabase_rpc("niki_importar_gastos_agendapro", {
+        "p_desde": start_day.isoformat(),
+        "p_hasta": end_day.isoformat(),
+        "p_location_ids": LOCATIONS,
+        "p_rows": rows,
+        "p_sync_run_id": sync_run_id,
+        "p_pages": pages,
+        "p_locations": locations,
+    }, timeout=180)
+    log(f"Gastos AgendaPro: {len(rows)} registros, {pages} páginas; {start_day} a {end_day}")
+    return {"enabled": True, "from": start_day.isoformat(), "to": end_day.isoformat(), "rows": len(rows), "pages": pages, "result": result}
+
+
+def capture_booking_time_schema(payments):
+    """Diagnóstico acotado: estructura y tiempos; nunca copiar el booking entero."""
+    from pathlib import Path
+    import re
+    path = Path("agendapro_booking_schema.json")
+    try:
+        samples = json.loads(path.read_text()) if path.exists() else []
+    except (ValueError, OSError):
+        samples = []
+    if len(samples) >= 5:
+        return
+    allowed = {"start", "end", "start_date", "end_date", "start_time", "end_time", "starts_at", "ends_at", "started_at", "ended_at", "date", "duration", "duration_minutes", "duration_min", "service_duration"}
+
+    def structure(value, depth=0):
+        if depth > 2:
+            return type(value).__name__
+        if isinstance(value, dict):
+            return {str(k): structure(v, depth + 1) for k, v in value.items()}
+        if isinstance(value, list):
+            return [structure(value[0], depth + 1)] if value else []
+        return type(value).__name__
+
+    def timings(value, prefix="", depth=0):
+        result = {}
+        if depth > 2 or not isinstance(value, dict):
+            return result
+        for key, child in value.items():
+            label = f"{prefix}.{key}" if prefix else key
+            if key in allowed and not isinstance(child, bool):
+                if isinstance(child, (int, float)) and key.startswith("duration"):
+                    result[label] = child
+                elif isinstance(child, str) and len(child) <= 48 and re.fullmatch(r"[0-9TtZz:+./ \-]+", child):
+                    result[label] = child
+            if isinstance(child, dict) and key not in {"client", "user", "customer", "service_provider"}:
+                result.update(timings(child, label, depth + 1))
+        return result
+
+    for payment in payments:
+        candidates = [("payment.bookings", b) for b in payment.get("bookings") or []]
+        for receipt in payment.get("receipts") or []:
+            candidates.extend(("receipt.bookings", b) for b in receipt.get("bookings") or [])
+        for origin, booking in candidates:
+            if not isinstance(booking, dict):
+                continue
+            sample = {"origin": origin, "structure": structure(booking), "timing_fields": timings(booking)}
+            if sample not in samples:
+                samples.append(sample)
+            if len(samples) >= 5:
+                break
+        if len(samples) >= 5:
+            break
+    path.write_text(json.dumps(samples, ensure_ascii=False, indent=2))
+
+
 def main():
     started = time.time()
     today_arg = datetime.now(ARG_TZ).date()
@@ -1543,6 +1745,8 @@ def main():
         shadow_state = refresh_commission_shadow_best_effort(start_day, end_day)
         shadow_refresh = shadow_state["result"]
 
+        expense_state = sync_agendapro_expenses(cookie_header, start_day, end_day, sync_run_id)
+
         elapsed = round(time.time() - started, 1)
 
         warnings = []
@@ -1588,6 +1792,7 @@ def main():
             "sync_to": end_day.isoformat(),
             "rolling_day_by_day": SYNC_MODE == "rolling",
             "rolling_purged_sales": purged_sales,
+            "expenses": expense_state,
             "warnings": warnings,
         }
 

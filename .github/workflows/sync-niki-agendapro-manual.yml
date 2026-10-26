@@ -12,14 +12,15 @@ on:
           - today
           - rolling
           - historical
+          - expenses_only
 
       sync_from:
-        description: "Desde (YYYY-MM-DD) - solo para historical"
+        description: "Desde (YYYY-MM-DD) - para historical o expenses_only"
         required: false
         type: string
 
       sync_to:
-        description: "Hasta (YYYY-MM-DD) - solo para historical"
+        description: "Hasta (YYYY-MM-DD) - para historical o expenses_only"
         required: false
         type: string
 
@@ -58,34 +59,38 @@ jobs:
 
       - name: Resolve sync mode
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SYNC_MODE: ${{ inputs.sync_mode }}
+          INPUT_SYNC_FROM: ${{ inputs.sync_from }}
+          INPUT_SYNC_TO: ${{ inputs.sync_to }}
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            SYNC_MODE="${{ inputs.sync_mode }}"
-
-            if [ "$SYNC_MODE" = "historical" ]; then
-              SYNC_FROM="${{ inputs.sync_from }}"
-              SYNC_TO="${{ inputs.sync_to }}"
-
-              if [ -z "$SYNC_FROM" ] || [ -z "$SYNC_TO" ]; then
-                echo "Para historical tenés que completar Desde y Hasta."
-                exit 1
-              fi
-
-              echo "SYNC_FROM=$SYNC_FROM" >> "$GITHUB_ENV"
-              echo "SYNC_TO=$SYNC_TO" >> "$GITHUB_ENV"
-              echo "Rango histórico: $SYNC_FROM -> $SYNC_TO"
-            fi
-
-          elif [ "${{ github.event.schedule }}" = "30 3 * * *" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SYNC_MODE="${INPUT_SYNC_MODE:-today}"
+            case "$SYNC_MODE" in
+              today|rolling) ;;
+              historical|expenses_only)
+                SYNC_FROM="${INPUT_SYNC_FROM:-}"
+                SYNC_TO="${INPUT_SYNC_TO:-}"
+                if [[ ! "$SYNC_FROM" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [[ ! "$SYNC_TO" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+                  echo "Para historical o expenses_only completá Desde y Hasta en formato YYYY-MM-DD."
+                  exit 1
+                fi
+                printf 'SYNC_FROM=%s\nSYNC_TO=%s\n' "$SYNC_FROM" "$SYNC_TO" >> "$GITHUB_ENV"
+                echo "Rango: $SYNC_FROM -> $SYNC_TO"
+                ;;
+              *) echo "Modo de sincronización inválido"; exit 1 ;;
+            esac
+          elif [ "$EVENT_SCHEDULE" = "30 3 * * *" ]; then
             SYNC_MODE="rolling"
-
           else
             SYNC_MODE="today"
           fi
 
-          echo "SYNC_MODE=$SYNC_MODE" >> "$GITHUB_ENV"
+          printf 'SYNC_MODE=%s\n' "$SYNC_MODE" >> "$GITHUB_ENV"
           echo "Modo de sincronización: $SYNC_MODE"
 
       - name: Run AgendaPro multilocal sync

@@ -25,8 +25,8 @@ on:
         type: string
 
   schedule:
-    # Durante el día: cada hora de 08:15 a 23:15
-    - cron: "15 8-23 * * *"
+    # Sólo datos de hoy: cada hora, de 10:00 a 22:00 de Argentina (inclusive)
+    - cron: "0 10-22 * * *"
       timezone: "America/Argentina/Buenos_Aires"
 
     # Reconciliación nocturna: últimos 10 días
